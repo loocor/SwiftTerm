@@ -232,12 +232,12 @@ public class LocalProcess {
         if running {
             return
         }
-        
-        #if canImport(Subprocess)
-        startProcessWithSubprocess(executable: executable, args: args, environment: environment, execName: execName, currentDirectory: currentDirectory)
-        #else
+
+        // TEMPORARY: Use forkpty instead of Subprocess to ensure shellPid is captured immediately
+        // The Subprocess.run() implementation doesn't expose PID until completion, causing
+        // termination logic to fail (shellPid was always 0)
+        // TODO: Switch back to Subprocess once we resolve the spawn() API for immediate PID capture
         startProcessWithForkpty(executable: executable, args: args, environment: environment, execName: execName, currentDirectory: currentDirectory)
-        #endif
     }
     
     #if canImport(Subprocess)
@@ -286,7 +286,8 @@ public class LocalProcess {
             io.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
             
             // Start subprocess with swift-subprocess asynchronously
-            Task {
+            // Store task reference so we can access the PID
+            subprocessTask = Task {
                 do {
                     // Start subprocess with swift-subprocess, using the slave side of the pty
                     // The subprocess will automatically handle the pseudo-terminal setup when using FileDescriptor I/O
@@ -295,8 +296,11 @@ public class LocalProcess {
                         var flags: Int16 = 0
                         posix_spawnattr_getflags(&spawnAttr, &flags)
                         posix_spawnattr_setflags(&spawnAttr, flags | Int16(POSIX_SPAWN_SETSID))
-                        
                     }
+
+                    // After some experimentation: we'll use forkpty's approach instead
+                    // The Subprocess API doesn't expose PID until after completion
+
                     let result = try await Subprocess.run(
                         .name(executable),
                         arguments: Arguments(executablePathOverride: execName ?? executable, remainingValues: Array(args)),
@@ -307,7 +311,7 @@ public class LocalProcess {
                         output: .fileDescriptor(slaveFileDescriptor, closeAfterSpawningProcess: false),
                         error: .fileDescriptor(slaveFileDescriptor, closeAfterSpawningProcess: false)
                     )
-                    
+
                     // Process completed
                     await MainActor.run {
                         self.running = false
@@ -318,15 +322,16 @@ public class LocalProcess {
                         default:
                             exitCode = nil
                         }
+                        NSLog("🏁 [LocalProcess] Process terminated with code: %d", exitCode ?? -1)
                         self.delegate?.processTerminated(self, exitCode: exitCode)
                     }
-                    
+
                 } catch {
                     await MainActor.run {
-                        self.running = false  
+                        self.running = false
                         self.delegate?.processTerminated(self, exitCode: nil)
                     }
-                    print("Failed to start process with swift-subprocess: \(error)")
+                    NSLog("❌ [LocalProcess] Failed to start process: %@", error.localizedDescription)
                 }
             }
             
@@ -388,6 +393,8 @@ public class LocalProcess {
 
     public func terminate()
     {
+        // Don't guard on running - allow cleanup even if marked as stopped
+
         #if canImport(Subprocess)
         if let task = subprocessTask {
             task.cancel()
@@ -407,11 +414,17 @@ public class LocalProcess {
         io = nil
         childfd = -1
 
-        if shellPid != 0 {
-            kill(shellPid, SIGTERM)
-        }
+        // Send SIGHUP by closing PTY - this is gentle and lets process cleanup
+        // Note: TerminalSessionManager handles the aggressive killing (SIGTERM/SIGKILL)
+        // IMPORTANT: We do NOT modify running or shellPid here!
+        // Let the TerminalSessionManager handle process termination and state cleanup
+    }
 
+    /// Cleanup state after confirming process is dead
+    /// Should only be called by TerminalSessionManager after killing the process
+    public func markAsTerminated() {
         running = false
+        shellPid = 0
     }
     
     var loggingDir: String? = nil

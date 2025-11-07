@@ -1717,17 +1717,8 @@ open class Terminal {
             let text = groups [next]
             
             if text.first == UInt8 (ascii: "?") {
-                switch next {
-                case 0:
-                    reportColor (oscCode: 10, color: foregroundColor)
-                case 1:
-                    reportColor (oscCode: 11, color: backgroundColor)
-                case 2:
-                    reportColor (oscCode: 11, color: cursorColor ?? foregroundColor)
-                default:
-                    break
-                }
-                
+                // Silently ignore OSC 10/11 color queries to avoid echoing replies into
+                // clients that concurrently read TTY input (e.g., TUIs managing focus).
                 continue
             }
 

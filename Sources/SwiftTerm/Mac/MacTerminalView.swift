@@ -94,9 +94,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var cellDimension: CellDimension!
     var caretView: CaretView!
     public var terminal: Terminal!
+    /// When true, skip expensive grid reflow while the view is in live-resize; apply once on resize end.
+    public var deferReflowDuringLiveResize: Bool = false
 
     var selection: SelectionService!
     private var scroller: NSScroller!
+    /// When true, TerminalView will not show or reserve space for the built-in vertical scroller.
+    public var suppressBuiltInScroller: Bool = false
     
     // Attribute dictionary, maps a console attribute (color, flags) to the corresponding dictionary
     // of attributes for an NSAttributedString
@@ -303,6 +307,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     func setupScroller()
     {
+        if suppressBuiltInScroller {
+            if scroller == nil { scroller = NSScroller(frame: .zero) }
+            scroller.removeFromSuperview()
+            scroller.frame = .zero
+            return
+        }
         let style: NSScroller.Style = .legacy
         let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: style)
         let scrollerFrame = NSRect(x: bounds.maxX - scrollerWidth, y: 0, width: scrollerWidth, height: bounds.height)
@@ -315,9 +325,36 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         scroller.scrollerStyle = style
         scroller.knobProportion = 0.1
         scroller.isEnabled = false
-        addSubview (scroller)
+        if scroller.superview !== self { addSubview (scroller) }
         scroller.action = #selector(scrollerActivated)
         scroller.target = self
+    }
+
+    /// Ensures the terminal uses a visible vertical scroller with legacy style (non-overlay).
+    /// Call this after attaching the view to enforce appearance on systems that prefer overlay scrollers.
+    public func preferLegacyVerticalScroller() {
+        guard scroller != nil, suppressBuiltInScroller == false else { return }
+        scroller.scrollerStyle = .legacy
+        scroller.isHidden = false
+        scroller.alphaValue = 1.0
+        // Reapply a proper frame in case bounds changed before this call
+        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        scroller.frame = NSRect(x: bounds.maxX - scrollerWidth, y: 0, width: scrollerWidth, height: bounds.height)
+        updateScroller()
+    }
+
+    /// Disables the built-in scroller; use when hosting a custom overlay scrollbar.
+    public func disableBuiltInScroller() {
+        suppressBuiltInScroller = true
+        setupScroller() // will remove from superview and zero the frame
+        needsDisplay = true
+    }
+
+    /// Enables the built-in legacy scroller again.
+    public func enableBuiltInScroller() {
+        suppressBuiltInScroller = false
+        setupScroller()
+        preferLegacyVerticalScroller()
     }
     
     /// This method sents the `nativeForegroundColor` and `nativeBackgroundColor`
@@ -430,7 +467,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         set(newValue) {
             super.frame = newValue
             guard cellDimension != nil else { return }
-            processSizeChange(newSize: newValue.size)
+            if deferReflowDuringLiveResize && inLiveResize {
+                // Defer grid reflow to resize end to avoid heavy recomputation and visual glitches
+                needsDisplay = true
+            } else {
+                processSizeChange(newSize: newValue.size)
+            }
             needsDisplay = true
             updateCursorPosition()
         }
@@ -439,6 +481,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         setupScroller()
+    }
+
+    open override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        if deferReflowDuringLiveResize {
+            _ = processSizeChange(newSize: frame.size)
+            needsDisplay = true
+            updateCursorPosition()
+        }
     }
 
     public override func resizeSubviews(withOldSize oldSize: NSSize) {
