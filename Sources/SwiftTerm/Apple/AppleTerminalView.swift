@@ -9,6 +9,7 @@
 import Foundation
 import CoreGraphics
 import CoreText
+import os
 
 #if os(iOS) || os(visionOS)
 import UIKit
@@ -36,15 +37,336 @@ struct ViewLineInfo {
     var images: [TerminalImage]?
 }
 
+struct CachedLine {
+    let row: Int
+    let lineIdentifier: ObjectIdentifier
+    let version: UInt64
+    let selectionGeneration: UInt64
+    let lineInfo: ViewLineInfo
+    let ctLine: CTLine
+}
+
+public struct RenderStats {
+    var cacheHits: Int = 0
+    var cacheMisses: Int = 0
+    var linesDrawn: Int = 0
+    var dirtyLinesExamined: Int = 0
+    var scrollDeltaRows: Int = 0
+    var scrollBlitAttempts: Int = 0
+    var scrollBlitHits: Int = 0
+    var scrollBlitExposedRows: Int = 0
+    var linesRebuilt: Int = 0
+    var charsRebuilt: Int = 0
+}
+
+#if canImport(os)
+private let renderLog = OSLog(subsystem: "com.codmate.swiftterm", category: "render")
+#endif
+
+// Display throttling state used by queuePendingDisplay/resume
+struct DisplayThrottleState {
+    var suspended: Bool = false
+    var needsFlushWhenResumed: Bool = false
+}
+
+struct GlyphWidthCache {
+    private struct Entry {
+        var value: Int
+        var age: UInt64
+    }
+    private var cache: [UInt32: Entry] = [:]
+    private var currentAge: UInt64 = 0
+    private let capacity: Int
+    init(capacity: Int) {
+        self.capacity = max(64, capacity)
+    }
+    mutating func value(for scalar: UInt32, resolver: () -> Int) -> Int {
+        currentAge &+= 1
+        if var entry = cache[scalar] {
+            entry.age = currentAge
+            cache[scalar] = entry
+            return entry.value
+        }
+        let width = resolver()
+        cache[scalar] = Entry(value: width, age: currentAge)
+        if cache.count > capacity {
+            evictLeastRecent()
+        }
+        return width
+    }
+    mutating func reset() {
+        cache.removeAll(keepingCapacity: true)
+        currentAge = 0
+    }
+    private mutating func evictLeastRecent() {
+        guard let victim = cache.min(by: { $0.value.age < $1.value.age })?.key else {
+            return
+        }
+        cache.removeValue(forKey: victim)
+    }
+}
+
+struct ColorMapCacheKey: Hashable {
+    let color: Attribute.Color
+    let isFg: Bool
+    let isBold: Bool
+    let useBrightColors: Bool
+}
+
+struct ColorMapCache {
+    private struct Entry {
+        var color: TTColor
+        var age: UInt64
+    }
+    private var cache: [ColorMapCacheKey: Entry] = [:]
+    private var currentAge: UInt64 = 0
+    private let capacity: Int
+    init(capacity: Int) {
+        self.capacity = max(64, capacity)
+    }
+    mutating func color(for key: ColorMapCacheKey, resolver: () -> TTColor) -> TTColor {
+        currentAge &+= 1
+        if var entry = cache[key] {
+            entry.age = currentAge
+            cache[key] = entry
+            return entry.color
+        }
+        let value = resolver()
+        cache[key] = Entry(color: value, age: currentAge)
+        if cache.count > capacity {
+            evictLeastRecent()
+        }
+        return value
+    }
+    mutating func reset() {
+        cache.removeAll(keepingCapacity: true)
+        currentAge = 0
+    }
+    private mutating func evictLeastRecent() {
+        guard let victim = cache.min(by: { $0.value.age < $1.value.age })?.key else {
+            return
+        }
+        cache.removeValue(forKey: victim)
+    }
+}
+
 extension TerminalView {
     typealias CellDimension = CGSize
     
+    // When true, queuePendingDisplay will avoid scheduling a redraw and mark
+    // needsFlushWhenResumed to repaint once resumed.
+    var displayThrottleState: DisplayThrottleState {
+        get { _displayThrottleState }
+        set { _displayThrottleState = newValue }
+    }
+
+    // Track which visible rows should be redrawn in the current paint pass.
+    var dirtyRowsToDraw: Set<Int> {
+        get { _dirtyRowsToDraw }
+        set { _dirtyRowsToDraw = newValue }
+    }
+
+    // Track last drawn render metrics (for diagnostics).
+    public var renderStats: RenderStats {
+        get { _renderStats }
+        set { _renderStats = newValue }
+    }
+
+    // Whether to emit os_signpost entries for draw passes.
+    public var renderInstrumentationEnabled: Bool {
+        get { _renderInstrumentationEnabled }
+        set { _renderInstrumentationEnabled = newValue }
+    }
+
+    // Last scroll delta applied via blit (rows, positive when yDisp increased).
+    var lastScrollDeltaRows: Int {
+        get { _lastScrollDeltaRows }
+        set { _lastScrollDeltaRows = newValue }
+    }
+
+    // Scroll blit accounting used for renderStats.
+    var pendingScrollBlitAttempts: Int {
+        get { _pendingScrollBlitAttempts }
+        set { _pendingScrollBlitAttempts = newValue }
+    }
+    var pendingScrollBlitHits: Int {
+        get { _pendingScrollBlitHits }
+        set { _pendingScrollBlitHits = newValue }
+    }
+    var pendingScrollBlitExposedRows: Int {
+        get { _pendingScrollBlitExposedRows }
+        set { _pendingScrollBlitExposedRows = newValue }
+    }
+    var lastScrollExposedRows: Int {
+        get { _lastScrollExposedRows }
+        set { _lastScrollExposedRows = newValue }
+    }
+
+    // Counts of line/string rebuild work during the current paint.
+    var renderRebuildLineCount: Int {
+        get { _renderRebuildLineCount }
+        set { _renderRebuildLineCount = newValue }
+    }
+    var renderRebuildCharCount: Int {
+        get { _renderRebuildCharCount }
+        set { _renderRebuildCharCount = newValue }
+    }
+
+    // Logging controls for render stats.
+    var renderLogEveryNFrames: Int {
+        get { _renderLogEveryNFrames }
+        set { _renderLogEveryNFrames = max(0, newValue) }
+    }
+    var renderLogFrameCounter: Int {
+        get { _renderLogFrameCounter }
+        set { _renderLogFrameCounter = newValue }
+    }
+    var renderLogUsePrint: Bool {
+        get { _renderLogUsePrint }
+        set { _renderLogUsePrint = newValue }
+    }
+    
+    // Track last drawn yDisp to detect scrolling and fall back to full redraw for new viewport.
+    var lastDrawnYDisp: Int {
+        get { _lastDrawnYDisp }
+        set { _lastDrawnYDisp = newValue }
+    }
+
     func resetCaches ()
     {
         self.attributes = [:]
         self.urlAttributes = [:]
         self.colors = Array(repeating: nil, count: 256)
         self.trueColors = [:]
+        glyphWidthCache.reset()
+        colorMapCache.reset()
+        invalidateLineRenderCache()
+    }
+
+    func prewarmCachesIfNeeded() {
+        if cachesPrewarmed { return }
+        // Prime glyph widths for common ASCII to reduce first-keypress spikes.
+        for scalar in 32...126 {
+            let u = UInt32(scalar)
+            _ = glyphWidthCache.value(for: u) {
+                Wcwidth.scalarSize(Int(u))
+            }
+        }
+        // Prime a small set of ANSI colors for both fg/bg to populate ColorMapCache.
+        for idx in 0...15 {
+            let ansi = UInt8(idx)
+            _ = mapColor(color: .ansi256(code: ansi), isFg: true, isBold: false, useBrightColors: true)
+            _ = mapColor(color: .ansi256(code: ansi), isFg: false, isBold: false, useBrightColors: true)
+        }
+        _ = mapColor(color: .defaultColor, isFg: true, isBold: false, useBrightColors: true)
+        _ = mapColor(color: .defaultColor, isFg: false, isBold: false, useBrightColors: true)
+        cachesPrewarmed = true
+    }
+
+    func invalidateLineRenderCache() {
+        lineRenderCache.removeAll(keepingCapacity: false)
+    }
+
+    func cachedLine(forRow row: Int, line: BufferLine, cols: Int) -> CachedLine {
+        let identifier = ObjectIdentifier(line)
+        if let cached = lineRenderCache[row],
+           cached.lineIdentifier == identifier,
+           cached.version == line.renderGeneration,
+           cached.selectionGeneration == selectionGeneration {
+            _renderStats.cacheHits &+= 1
+            return cached
+        }
+
+        // During scroll, the same BufferLine may move to a different row index.
+        if let reused = lineRenderCache.values.first(where: {
+            $0.lineIdentifier == identifier &&
+            $0.version == line.renderGeneration &&
+            $0.selectionGeneration == selectionGeneration
+        }) {
+            _renderStats.cacheHits &+= 1
+            let updated = CachedLine(row: row,
+                                     lineIdentifier: identifier,
+                                     version: line.renderGeneration,
+                                     selectionGeneration: selectionGeneration,
+                                     lineInfo: reused.lineInfo,
+                                     ctLine: reused.ctLine)
+            lineRenderCache[row] = updated
+            return updated
+        }
+
+        _renderStats.cacheMisses &+= 1
+        let lineInfo = buildAttributedString(row: row, line: line, cols: cols)
+        let ctline = CTLineCreateWithAttributedString(lineInfo.attrStr)
+        renderRebuildLineCount &+= 1
+        renderRebuildCharCount &+= lineInfo.attrStr.length
+        let updated = CachedLine(row: row,
+                                 lineIdentifier: identifier,
+                                 version: line.renderGeneration,
+                                 selectionGeneration: selectionGeneration,
+                                 lineInfo: lineInfo,
+                                 ctLine: ctline)
+        lineRenderCache[row] = updated
+        return updated
+    }
+
+    func logRenderStatsIfNeeded() {
+        guard renderLogEveryNFrames > 0 else { return }
+        renderLogFrameCounter &+= 1
+        guard renderLogFrameCounter % renderLogEveryNFrames == 0 else { return }
+        let stats = _renderStats
+        #if canImport(os)
+        if #available(macOS 10.12, iOS 12.0, *) {
+            os_log("render frame drawn:%{public}d hits:%{public}d misses:%{public}d rebuilt:%{public}d chars:%{public}d dirty:%{public}d scroll:%{public}d blit:%{public}d/%{public}d exp:%{public}d",
+                   log: renderLog,
+                   type: .info,
+                   stats.linesDrawn,
+                   stats.cacheHits,
+                   stats.cacheMisses,
+                   stats.linesRebuilt,
+                   stats.charsRebuilt,
+                   stats.dirtyLinesExamined,
+                   stats.scrollDeltaRows,
+                   stats.scrollBlitHits,
+                   stats.scrollBlitAttempts,
+                   stats.scrollBlitExposedRows)
+            if !renderLogUsePrint {
+                return
+            }
+        }
+        #endif
+        if renderLogUsePrint {
+            print("render frame drawn:\(stats.linesDrawn) hits:\(stats.cacheHits) misses:\(stats.cacheMisses) rebuilt:\(stats.linesRebuilt) chars:\(stats.charsRebuilt) dirty:\(stats.dirtyLinesExamined) scroll:\(stats.scrollDeltaRows) blit:\(stats.scrollBlitHits)/\(stats.scrollBlitAttempts) exp:\(stats.scrollBlitExposedRows)")
+        }
+    }
+
+    func pruneLineRenderCache(visibleStart: Int, visibleEnd: Int) {
+        guard lineRenderCache.count > 0 else {
+            return
+        }
+        guard let terminal else {
+            lineRenderCache.removeAll()
+            return
+        }
+
+        // Allow a larger cache to reduce CTLine rebuilds during scroll/oscillating updates.
+        let maxEntries = max(terminal.rows * 8, 512)
+        guard lineRenderCache.count > maxEntries else {
+            return
+        }
+
+        let padding = max(terminal.rows, 1)
+        let lowerBound = max(visibleStart - padding, 0)
+        let upperBound = visibleEnd + padding
+        var keysToRemove: [Int] = []
+        keysToRemove.reserveCapacity(lineRenderCache.count - maxEntries)
+        for key in lineRenderCache.keys {
+            if key < lowerBound || key > upperBound {
+                keysToRemove.append(key)
+            }
+        }
+        for key in keysToRemove {
+            lineRenderCache.removeValue(forKey: key)
+        }
     }
     
     // This is invoked when the font changes to recompute state
@@ -133,6 +455,7 @@ extension TerminalView {
             terminalDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
            
             updateScroller()
+            invalidateLineRenderCache()
             return true
         }
         return false
@@ -168,45 +491,41 @@ extension TerminalView {
     
     func mapColor (color: Attribute.Color, isFg: Bool, isBold: Bool, useBrightColors: Bool = true) -> TTColor
     {
+        let key = ColorMapCacheKey(color: color, isFg: isFg, isBold: isBold, useBrightColors: useBrightColors)
+        return colorMapCache.color(for: key) { [self] in
+            return resolveMapColor(color: color, isFg: isFg, isBold: isBold, useBrightColors: useBrightColors)
+        }
+    }
+
+    private func resolveMapColor(color: Attribute.Color, isFg: Bool, isBold: Bool, useBrightColors: Bool) -> TTColor {
         switch color {
         case .defaultColor:
-            if isFg {
-                return nativeForegroundColor
-            } else {
-                return nativeBackgroundColor
-            }
+            return isFg ? nativeForegroundColor : nativeBackgroundColor
         case .defaultInvertedColor:
-            if isFg {
-                return nativeForegroundColor.inverseColor()
-            } else {
-                return nativeBackgroundColor.inverseColor()
-            }
+            return isFg ? nativeForegroundColor.inverseColor() : nativeBackgroundColor.inverseColor()
         case .ansi256(let ansi):
             var midx: Int
-            // if high - bright colors are enabled we will represent bold text by using more intense colors
-            // otherwise we will reduce colors but use bold fonts
             if useBrightColors {
-                midx = ansi < 7 ? (Int (ansi) + (isBold ? 8 : 0)) : Int (ansi)
+                midx = ansi < 7 ? (Int(ansi) + (isBold ? 8 : 0)) : Int(ansi)
             } else {
-                midx = ansi > 7 ? (Int (ansi) - 8) : Int(ansi)
+                midx = ansi > 7 ? (Int(ansi) - 8) : Int(ansi)
             }
-            if let c = colors [midx] {
+            if let c = colors[midx] {
                 return c
             }
-            let tcolor = terminal.ansiColors [midx]
-            let newColor = TTColor.make (color: tcolor)
-            colors [midx] = newColor
+            let tcolor = terminal.ansiColors[midx]
+            let newColor = TTColor.make(color: tcolor)
+            colors[midx] = newColor
             return newColor
         case .trueColor(let r, let g, let b):
-            if let tc = trueColors [color] {
+            if let tc = trueColors[color] {
                 return tc
             }
-            let newColor = TTColor.make(red: CGFloat (r) / 255.0,
-                                        green: CGFloat (g) / 255.0,
-                                        blue: CGFloat (b) / 255.0,
+            let newColor = TTColor.make(red: CGFloat(r) / 255.0,
+                                        green: CGFloat(g) / 255.0,
+                                        blue: CGFloat(b) / 255.0,
                                         alpha: 1.0)
-            
-            trueColors [color] = newColor
+            trueColors[color] = newColor
             return newColor
         }
     }
@@ -216,8 +535,10 @@ extension TerminalView {
     {
         urlAttributes = [:]
         attributes = [:]
+        colorMapCache.reset()
         
         terminal.updateFullScreen ()
+        invalidateLineRenderCache()
         queuePendingDisplay()
     }
     
@@ -397,55 +718,91 @@ extension TerminalView {
     //
     func buildAttributedString (row: Int, line: BufferLine, cols: Int, prefix: String = "") -> ViewLineInfo
     {
-        let res = NSMutableAttributedString ()
-        var attr = Attribute.empty
-        var hasUrl = false
-        
-        var str = prefix
+        struct LineRun {
+            var attr: Attribute
+            var hasUrl: Bool
+            var start: Int
+            var length: Int
+        }
+        var runs: [LineRun] = []
+        runs.reserveCapacity(cols / 4)
+        let prefixUTF16Count = prefix.utf16.count
+        var utf16Buffer: [UInt16] = []
+        utf16Buffer.reserveCapacity(prefixUTF16Count + cols + 8)
+        if prefixUTF16Count > 0 {
+            utf16Buffer.append(contentsOf: prefix.utf16)
+        }
+        var currentLength = utf16Buffer.count
+        var pendingPrefixLength = prefixUTF16Count
+        var hasActiveRun = false
+        var currentAttr = Attribute.empty
+        var currentHasUrl = false
+        var currentRunStart = 0
         var col = 0
+
+        func finalizeActiveRun() {
+            if hasActiveRun {
+                runs.append(LineRun(attr: currentAttr,
+                                    hasUrl: currentHasUrl,
+                                    start: currentRunStart,
+                                    length: currentLength - currentRunStart))
+                hasActiveRun = false
+            }
+        }
+
+        func startRun(attr: Attribute, hasUrl: Bool) {
+            finalizeActiveRun()
+            currentAttr = attr
+            currentHasUrl = hasUrl
+            if pendingPrefixLength > 0 {
+                currentRunStart = 0
+                pendingPrefixLength = 0
+            } else {
+                currentRunStart = currentLength
+            }
+            hasActiveRun = true
+        }
         
         while col < cols {
             let ch: CharData = line[col]
-            if col == 0 {
-                attr = ch.attribute
-                if ch.hasPayload {
-                    hasUrl = true
-                }
-            } else {
-                var chhas: Bool = false
-                if ch.hasPayload {
-                    chhas = true
-                }
-
-                if attr != ch.attribute || chhas != hasUrl {
-                    res.append(NSAttributedString (string: str, attributes: getAttributes (attr, withUrl: hasUrl)))
-                    str = ""
-                    attr = ch.attribute
-                    hasUrl = chhas
-                }
+            let chHasUrl = ch.hasPayload
+            if !hasActiveRun || currentAttr != ch.attribute || currentHasUrl != chHasUrl {
+                startRun(attr: ch.attribute, hasUrl: chHasUrl)
             }
-            
             let code = ch.code
-            let notWide = code <= 0xa0 || (code > 0x452 && code < 0x1100) || Wcwidth.scalarSize(Int(code)) < 2
-            if notWide  {
-                str.append(code == 0 ? " " : ch.getCharacter ())
-            } else {
-                // If we have a wide character, we flush the contents we have so far
-                res.append(NSAttributedString (string: str, attributes: getAttributes (attr, withUrl: hasUrl)))
-                // Then add the character, and add an extra space, so that the space gets the same attributes as the previous
-                // cell - see https://github.com/migueldeicaza/SwiftTerm/pull/387
-                res.append(NSAttributedString (string: "\(ch.getCharacter()) ", attributes: getAttributes (attr, withUrl: hasUrl)))
-                
-                str = ""
+            let isWide = ch.width > 1
+            let renderedChar = code == 0 ? " " : ch.getCharacter()
+            for unit in renderedChar.utf16 {
+                utf16Buffer.append(unit)
+                currentLength &+= 1
+            }
+            if isWide {
+                utf16Buffer.append(UInt16(UnicodeScalar(" ").value))
+                currentLength &+= 1
                 col += 1
             }
             col += 1
         }
-        res.append (NSAttributedString(string: str, attributes: getAttributes(attr, withUrl: hasUrl)))
+        finalizeActiveRun()
+        let finalString: String
+        if utf16Buffer.isEmpty {
+            finalString = ""
+        } else {
+            finalString = utf16Buffer.withUnsafeBufferPointer { ptr in
+                String(utf16CodeUnits: ptr.baseAddress!, count: ptr.count)
+            }
+        }
+        let res = NSMutableAttributedString(string: finalString)
+        res.beginEditing()
+        if runs.isEmpty && !finalString.isEmpty {
+            res.setAttributes(getAttributes(.empty, withUrl: false), range: NSRange(location: 0, length: finalString.utf16.count))
+        } else {
+            for run in runs where run.length > 0 {
+                res.setAttributes(getAttributes(run.attr, withUrl: run.hasUrl), range: NSRange(location: run.start, length: run.length))
+            }
+        }
+        res.endEditing()
         updateSelectionAttributesIfNeeded(attributedLine: res, row: row, cols: cols)
-        // This gives us a large chunk of our performance back, from 7.5 to 5.5 seconds on
-        // time for x in 1 2 3 4 5 6; do cat UTF-8-demo.txt; done
-        //res.fixAttributes(in: NSRange(location: 0, length: res.length))
         return ViewLineInfo(attrStr: res, images: line.images)
     }
     
@@ -608,7 +965,71 @@ extension TerminalView {
         let lastRow = terminal.buffer.yDisp+Int((boundsMaxY-dirtyRect.minY)/cellHeight)
         #endif
 
-        for row in firstRow...lastRow {
+        let dirtySet = dirtyRowsToDraw
+        _renderStats.cacheHits = 0
+        _renderStats.cacheMisses = 0
+        _renderStats.linesDrawn = 0
+        _renderStats.dirtyLinesExamined = 0
+        _renderStats.scrollDeltaRows = lastScrollDeltaRows
+        _renderStats.scrollBlitAttempts = pendingScrollBlitAttempts
+        _renderStats.scrollBlitHits = pendingScrollBlitHits
+        _renderStats.scrollBlitExposedRows = pendingScrollBlitExposedRows
+        _renderStats.linesRebuilt = 0
+        _renderStats.charsRebuilt = 0
+        renderRebuildLineCount = 0
+        renderRebuildCharCount = 0
+        pendingScrollBlitAttempts = 0
+        pendingScrollBlitHits = 0
+        pendingScrollBlitExposedRows = 0
+        #if canImport(os)
+        var signpostID: OSSignpostID?
+        if renderInstrumentationEnabled, #available(macOS 10.14, iOS 12.0, *) {
+            let totalRows = max(0, lastRow - firstRow + 1)
+            let dirtyCount = dirtySet.count
+            let scrollDelta = lastScrollDeltaRows
+            let newID = OSSignpostID(log: renderLog)
+            os_signpost(.begin, log: renderLog, name: "drawTerminalContents", signpostID: newID, "rows:%d dirty:%d scroll:%d", totalRows, dirtyCount, scrollDelta)
+            signpostID = newID
+        }
+        #endif
+        // Clear after each paint to avoid filtering stale rows during scroll.
+        defer { dirtyRowsToDraw = [] }
+        let currentYDisp = terminal.buffer.yDisp
+        let minVisible = firstRow - currentYDisp
+        let maxVisible = lastRow - currentYDisp
+        // Only enable filtering if:
+        //  - We are not in a new viewport (yDisp unchanged)
+        //  - Dirty set intersects visible rows
+        let forceFullRedrawThisScroll = lastScrollDeltaRows != 0
+        let useDirtyFilter: Bool = {
+            guard !dirtySet.isEmpty else { return false }
+            guard lastDrawnYDisp == currentYDisp else { return false }
+            return dirtySet.contains(where: { $0 >= minVisible && $0 <= maxVisible })
+        }()
+        let shouldUseDirtyFilter = !forceFullRedrawThisScroll && useDirtyFilter
+        lastDrawnYDisp = currentYDisp
+
+        var drawnLines = 0
+
+        // For scroll frames, rebuild only exposed rows but still draw cached lines for the rest.
+        let rowRange: ClosedRange<Int> = firstRow...lastRow
+        let scrollExposedRows: ClosedRange<Int>? = {
+            guard forceFullRedrawThisScroll, lastScrollExposedRows > 0 else { return nil }
+            if lastScrollDeltaRows > 0 {
+                // Scrolling down (into scrollback): new rows at bottom.
+                let start = max(firstRow, lastRow - lastScrollExposedRows + 1)
+                return start...lastRow
+            } else {
+                // Scrolling up (towards live buffer): new rows at top.
+                let end = min(lastRow, firstRow + lastScrollExposedRows - 1)
+                return firstRow...end
+            }
+        }()
+
+        for row in rowRange {
+            if shouldUseDirtyFilter && !dirtySet.contains(row - terminal.buffer.yDisp) {
+                continue
+            }
             if row < 0 {
                 continue
             }
@@ -669,8 +1090,29 @@ extension TerminalView {
             } 
             #endif
             let line = terminal.buffer.lines [row]
-            let lineInfo = buildAttributedString(row: row, line: line, cols: terminal.cols)
-            let ctline = CTLineCreateWithAttributedString(lineInfo.attrStr)
+            let cacheEntry: CachedLine
+            if forceFullRedrawThisScroll,
+               let exposed = scrollExposedRows,
+               exposed.contains(row) {
+                // Rebuild for newly exposed rows during scroll.
+                _renderStats.cacheMisses &+= 1
+                let lineInfo = buildAttributedString(row: row, line: line, cols: terminal.cols)
+                let ctline = CTLineCreateWithAttributedString(lineInfo.attrStr)
+                renderRebuildLineCount &+= 1
+                renderRebuildCharCount &+= lineInfo.attrStr.length
+                let updated = CachedLine(row: row,
+                                         lineIdentifier: ObjectIdentifier(line),
+                                         version: line.renderGeneration,
+                                         selectionGeneration: selectionGeneration,
+                                         lineInfo: lineInfo,
+                                         ctLine: ctline)
+                lineRenderCache[row] = updated
+                cacheEntry = updated
+            } else {
+                cacheEntry = cachedLine(forRow: row, line: line, cols: terminal.cols)
+            }
+            let lineInfo = cacheEntry.lineInfo
+            let ctline = cacheEntry.ctLine
 
             var col = 0
             for run in CTLineGetGlyphRuns(ctline) as? [CTRun] ?? [] {
@@ -775,7 +1217,23 @@ extension TerminalView {
             case .doubleWidth:
                 context.restoreGState()
             }
+            drawnLines &+= 1
         }
+
+        _renderStats.linesDrawn = drawnLines
+        _renderStats.dirtyLinesExamined = shouldUseDirtyFilter ? dirtySet.count : max(0, lastRow - firstRow + 1)
+        _renderStats.linesRebuilt = renderRebuildLineCount
+        _renderStats.charsRebuilt = renderRebuildCharCount
+        logRenderStatsIfNeeded()
+        #if canImport(os)
+        if renderInstrumentationEnabled, #available(macOS 10.14, iOS 12.0, *), let signpostID {
+            os_signpost(.end, log: renderLog, name: "drawTerminalContents", signpostID: signpostID, "drawn:%d hits:%d misses:%d rebuilt:%d chars:%d dirty:%d scroll:%d blit:%d/%d exp:%d", drawnLines, _renderStats.cacheHits, _renderStats.cacheMisses, _renderStats.linesRebuilt, _renderStats.charsRebuilt, _renderStats.dirtyLinesExamined, _renderStats.scrollDeltaRows, _renderStats.scrollBlitHits, _renderStats.scrollBlitAttempts, _renderStats.scrollBlitExposedRows)
+        }
+        #endif
+        lastScrollDeltaRows = 0
+        lastScrollExposedRows = 0
+
+        pruneLineRenderCache(visibleStart: bufferOffset, visibleEnd: bufferOffset + terminal.rows)
         
 #if os(macOS)
         // Fills gaps at the end with the default terminal background
@@ -863,23 +1321,57 @@ extension TerminalView {
             terminalDelegate?.rangeChanged (source: self, startY: rowStart, endY: rowEnd)
         }
 
+        // Capture dirty rows (if any) to enable filtering during draw.
+        let dirtyRowsSet = terminal.changedLines()
+        dirtyRowsToDraw = dirtyRowsSet
+
         terminal.clearUpdateRange ()
                 
         #if os(macOS)
         let baseLine = frame.height
-        var region = CGRect (x: 0,
-                             y: baseLine - (cellDimension.height + CGFloat(rowEnd) * cellDimension.height),
-                             width: frame.width,
-                             height: CGFloat(rowEnd-rowStart + 1) * cellDimension.height)
-        
-        // If we are the last line, we should also queue a refresh for the "remaining" bits at the
-        // end which can be redrawn by large unicode
-        if rowEnd == terminal.rows - 1 {
-            let oh = region.height
-            let oy = region.origin.y
-            region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
+        if dirtyRowsSet.isEmpty {
+            var region = CGRect (x: 0,
+                                 y: baseLine - (cellDimension.height + CGFloat(rowEnd) * cellDimension.height),
+                                 width: frame.width,
+                                 height: CGFloat(rowEnd-rowStart + 1) * cellDimension.height)
+            
+            // If we are the last line, we should also queue a refresh for the "remaining" bits at the
+            // end which can be redrawn by large unicode
+            if rowEnd == terminal.rows - 1 {
+                let oh = region.height
+                let oy = region.origin.y
+                region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
+            }
+            setNeedsDisplay(region)
+        } else {
+            let sorted = dirtyRowsSet.sorted()
+            var runStart = sorted.first!
+            var runEnd = runStart
+
+            func enqueueRegion(start: Int, end: Int) {
+                var region = CGRect(x: 0,
+                                    y: baseLine - (cellDimension.height + CGFloat(end) * cellDimension.height),
+                                    width: frame.width,
+                                    height: CGFloat(end - start + 1) * cellDimension.height)
+                if end == terminal.rows - 1 {
+                    let oh = region.height
+                    let oy = region.origin.y
+                    region = CGRect(x: 0, y: 0, width: frame.width, height: oh + oy)
+                }
+                setNeedsDisplay(region)
+            }
+
+            for row in sorted.dropFirst() {
+                if row == runEnd + 1 {
+                    runEnd = row
+                } else {
+                    enqueueRegion(start: runStart, end: runEnd)
+                    runStart = row
+                    runEnd = row
+                }
+            }
+            enqueueRegion(start: runStart, end: runEnd)
         }
-        setNeedsDisplay(region)
         #else
         // TODO iOS: need to update the code above, but will do that when I get some real
         // life data being fed into it.
@@ -941,16 +1433,24 @@ extension TerminalView {
     // It is also cheap, so should be called when new data has been posted or received.
     func queuePendingDisplay ()
     {
+        if displayThrottleState.suspended {
+            displayThrottleState.needsFlushWhenResumed = true
+            return
+        }
         // throttle
         if !pendingDisplay {
-            let fps60 = 16670000
-            // let fps30 = 16670000*2
-            let fpsDelay = fps60
+            // Aim for ~60fps to improve scroll smoothness; still throttled vs immediate redraw.
+            let targetFrameNs: UInt64 = 16_000_000
             pendingDisplay = true
             DispatchQueue.main.asyncAfter(
-                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
+                deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + targetFrameNs),
                 execute: updateDisplay)
         }
+    }
+
+    /// Public helper to schedule a display refresh honoring throttling.
+    public func requestDisplayRefresh() {
+        queuePendingDisplay()
     }
     
     ///
@@ -1030,6 +1530,53 @@ extension TerminalView {
                 terminal.buffer.lines.count > terminal.rows
         }
     }
+
+    @discardableResult
+    func performScrollBlit(from oldYDisp: Int, to newYDisp: Int) -> Bool {
+        let deltaRows = newYDisp - oldYDisp
+        lastScrollDeltaRows = deltaRows
+        pendingScrollBlitAttempts &+= 1
+        lastScrollExposedRows = 0
+        #if os(macOS)
+        guard deltaRows != 0 else { return false }
+        let rowsToMove = abs(deltaRows)
+        let maxBlitRows = max(terminal.rows * 3, terminal.rows)
+        if rowsToMove > maxBlitRows {
+            return false
+        }
+        let dy = CGFloat(deltaRows) * cellDimension.height
+        if dy == 0 || bounds.isEmpty {
+            return false
+        }
+
+        scroll(bounds, by: NSSize(width: 0, height: dy))
+
+        let exposedHeight = min(abs(dy), bounds.height)
+        if exposedHeight == 0 {
+            return true
+        }
+        let exposedRows = min(terminal.rows, Int(ceil(exposedHeight / cellDimension.height)))
+        let exposedRect: CGRect
+        let startRow: Int
+        if dy > 0 {
+            exposedRect = CGRect(x: 0, y: 0, width: bounds.width, height: exposedHeight)
+            startRow = max(terminal.rows - exposedRows, 0)
+        } else {
+            exposedRect = CGRect(x: 0, y: bounds.height - exposedHeight, width: bounds.width, height: exposedHeight)
+            startRow = 0
+        }
+        setNeedsDisplay(exposedRect)
+        if exposedRows > 0 {
+            terminal.refresh(startRow: startRow, endRow: startRow + exposedRows - 1)
+        }
+        pendingScrollBlitHits &+= 1
+        pendingScrollBlitExposedRows &+= exposedRows
+        lastScrollExposedRows = exposedRows
+        return true
+        #else
+        return false
+        #endif
+    }
     
     public func scroll (toPosition: Double)
     {
@@ -1057,18 +1604,21 @@ extension TerminalView {
     func scrollTo (row: Int, notifyAccessibility: Bool = true)
     {
         if row != terminal.buffer.yDisp {
-            
+            let oldYDisp = terminal.buffer.yDisp
             terminal.buffer.yDisp = row
-            
-            // tell the terminal we want to refresh all the rows
-            terminal.refresh (startRow: 0, endRow: terminal.rows)
-            
-            // do the display update
+
+            let usedBlit = performScrollBlit(from: oldYDisp, to: row)
+            if !usedBlit {
+                terminal.refresh(startRow: 0, endRow: terminal.rows)
+            }
+
             updateDisplay (notifyAccessibility: notifyAccessibility)
             //selectionView.notifyScrolled(source: terminal)
             terminalDelegate?.scrolled (source: self, position: scrollPosition)
             updateScroller()
-            setNeedsDisplay(frame)
+            if !usedBlit {
+                setNeedsDisplay(frame)
+            }
         }
     }
     

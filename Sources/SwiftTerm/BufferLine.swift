@@ -11,6 +11,13 @@ import Foundation
 /// BufferLines represents a single line of text displayed on the terminal
 
 public final class BufferLine: CustomDebugStringConvertible {
+    private var version: UInt64 = 0
+    public var renderGeneration: UInt64 {
+        return version
+    }
+    private func markDirty() {
+        version &+= 1
+    }
     public enum RenderLineMode {
         /// Render each character using a single cell
         case single
@@ -21,14 +28,26 @@ public final class BufferLine: CustomDebugStringConvertible {
         /// Renders the bottom of a character, using two cells
         case doubledDown
     }
-    var isWrapped: Bool
-    var renderMode: RenderLineMode = .single
+    var isWrapped: Bool {
+        didSet {
+            markDirty()
+        }
+    }
+    var renderMode: RenderLineMode = .single {
+        didSet {
+            markDirty()
+        }
+    }
     private var data: [CharData]
     private var dataSize: Int
-    
+
     private var fillCharacter: CharData //used to initialise data
-    
-    var images: [TerminalImage]?
+
+    var images: [TerminalImage]? {
+        didSet {
+            markDirty()
+        }
+    }
     
     public init (cols: Int, fillData: CharData? = nil, isWrapped: Bool = false)
     {
@@ -36,14 +55,16 @@ public final class BufferLine: CustomDebugStringConvertible {
         data = Array(repeating: fillCharacter, count: cols)
         dataSize = cols
         self.isWrapped = isWrapped
+        markDirty()
     }
-    
+
     public init (from other: BufferLine)
     {
         fillCharacter = other.fillCharacter
         isWrapped = other.isWrapped
         data = Array(other.data)
         dataSize = other.dataSize
+        version = other.version
     }
     
     /// Returns the number of CharData cells in this row
@@ -75,8 +96,10 @@ public final class BufferLine: CustomDebugStringConvertible {
                 // help future refactorings.
                 print("BufferLine: You passed an index out of range, adjusting to prevent crash, but you should debug")
                 data[dataSize-1] = value
+                markDirty()
             } else {
                 data[index] = value
+                markDirty()
             }
         }
     }
@@ -90,6 +113,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         let dataSize = dataSize
         let empty = CharData(attribute: attribute)
         data.replaceSubrange(0..<dataSize, with: repeatElement(empty, count: dataSize))
+        markDirty()
     }
     /// Test whether contains any chars.
     public func hasContent (index: Int) -> Bool {
@@ -128,6 +152,7 @@ public final class BufferLine: CustomDebugStringConvertible {
                 data [i] = fillData
             }
         }
+        markDirty()
     }
     
     /// Removes the cells at the specified position, shifting data leftwards
@@ -148,6 +173,7 @@ public final class BufferLine: CustomDebugStringConvertible {
                 data [i] = fillData
             }
         }
+        markDirty()
     }
     
     /// Replaces the cells in the start to end range with the specified fill data
@@ -159,6 +185,7 @@ public final class BufferLine: CustomDebugStringConvertible {
             data [idx] = fillData
             idx += 1
         }
+        markDirty()
     }
     
     /// Resizes the buffer line, if the new size is larger, the empty region is filled with
@@ -188,6 +215,7 @@ public final class BufferLine: CustomDebugStringConvertible {
                 dataSize = 0
             }
         }
+        markDirty()
     }
     
     /// Fills the entire bufferline with the specified ``CharData``
@@ -196,6 +224,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         for i in 0..<dataSize {
             data [i] = with
         }
+        markDirty()
     }
     
     /// Fills the specified region of the bufferline with the specified ``CharData``
@@ -208,6 +237,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         for i in 0..<len {
             data [i+atCol] = with
         }
+        markDirty()
     }
     
     /// Fills the current BufferLine with the contents of another BufferLine.
@@ -216,6 +246,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         data = line.data
         dataSize = line.dataSize
         isWrapped = line.isWrapped
+        markDirty()
     }
     
     /// Returns the trimmed length in terms of cells used from the BufferLine
@@ -239,6 +270,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     public func copyFrom (_ src: BufferLine, srcCol: Int, dstCol: Int, len: Int)
     {
         data.replaceSubrange(dstCol..<(dstCol+len), with: src.data [srcCol..<(srcCol+len)])
+        markDirty()
     }
     
     /// Returns the contents of the line as a string in the specified range
@@ -262,10 +294,12 @@ public final class BufferLine: CustomDebugStringConvertible {
     
     /// Attaches the specified terminal image to this buffer line
     public func attach (image: TerminalImage) {
-        if var imageArray = self.images {
-            imageArray.append (image)
+        if images != nil {
+            images!.append(image)
+            markDirty()
         } else {
             images = [image]
+            markDirty()
         }
     }
     
@@ -275,4 +309,3 @@ public final class BufferLine: CustomDebugStringConvertible {
         }
     }
 }
-

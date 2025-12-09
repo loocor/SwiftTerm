@@ -106,13 +106,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // of attributes for an NSAttributedString
     var attributes: [Attribute: [NSAttributedString.Key:Any]] = [:]
     var urlAttributes: [Attribute: [NSAttributedString.Key:Any]] = [:]
-    
-    
+
+
     // Cache for the colors in the 0..255 range
     var colors: [NSColor?] = Array(repeating: nil, count: 256)
     var trueColors: [Attribute.Color:NSColor] = [:]
     var transparent = TTColor.transparent ()
     var isBigSur = true
+    var lineRenderCache: [Int: CachedLine] = [:]
+    var selectionGeneration: UInt64 = 0
+    // Larger caches reduce repeated CoreText/mapColor work at the cost of more memory.
+    var glyphWidthCache = GlyphWidthCache(capacity: 8192)
+    var colorMapCache = ColorMapCache(capacity: 4096)
     
     /// This flag is automatically set to true after the initializer is called, if running on a system older than BigSur.
     /// Starting with BigSur any screen updates will invoke the draw() method with the whole region, regardless
@@ -170,17 +175,50 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         setupScroller()
         setupOptions()
+        applyDefaultRenderLogging()
         setupFocusNotification()
     }
-    
-    func startDisplayUpdates ()
-    {
-        // Not used on Mac
+
+    /// Enable periodic render logging when running in Debug, unless host overrides.
+    private func applyDefaultRenderLogging() {
+        #if DEBUG
+        if renderLogEveryNFrames == 0 {
+            if let env = ProcessInfo.processInfo.environment["SWIFTTERM_RENDER_LOG_FRAMES"],
+               let value = Int(env), value > 0 {
+                renderLogEveryNFrames = value
+            } else {
+                renderLogEveryNFrames = 10
+            }
+        }
+        renderLogUsePrint = true
+        #else
+        // In Release, allow opt-in via environment without spamming logs.
+        if let env = ProcessInfo.processInfo.environment["SWIFTTERM_RENDER_LOG_FRAMES"],
+           let value = Int(env), value > 0 {
+            renderLogEveryNFrames = value
+            renderLogUsePrint = true
+        }
+        #endif
     }
     
-    func suspendDisplayUpdates()
+    public func startDisplayUpdates ()
     {
-        // Not used on Mac
+        if displayThrottleState.suspended {
+            displayThrottleState.suspended = false
+            if displayThrottleState.needsFlushWhenResumed {
+                displayThrottleState.needsFlushWhenResumed = false
+                queuePendingDisplay()
+            }
+        }
+    }
+    
+    public func suspendDisplayUpdates()
+    {
+        displayThrottleState.suspended = true
+    }
+
+    public func resumeDisplayUpdates() {
+        startDisplayUpdates()
     }
     
     var becomeMainObserver, resignMainObserver: NSObjectProtocol?
@@ -215,6 +253,22 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     var _nativeFg, _nativeBg: TTColor!
     var settingFg = false, settingBg = false
+    var _displayThrottleState = DisplayThrottleState()
+    var _dirtyRowsToDraw: Set<Int> = []
+    var _lastDrawnYDisp: Int = 0
+    var _renderStats = RenderStats()
+    var _renderInstrumentationEnabled: Bool = false
+    var _lastScrollDeltaRows: Int = 0
+    var _pendingScrollBlitAttempts: Int = 0
+    var _pendingScrollBlitHits: Int = 0
+    var _pendingScrollBlitExposedRows: Int = 0
+    var _renderRebuildLineCount: Int = 0
+    var _renderRebuildCharCount: Int = 0
+    var _renderLogEveryNFrames: Int = 0
+    var _renderLogFrameCounter: Int = 0
+    var _renderLogUsePrint: Bool = false
+    var _lastScrollExposedRows: Int = 0
+    var cachesPrewarmed = false
     /**
      * This will set the native foreground color to the specified native color (UIColor or NSColor)
      * and will have this reflected into the underlying's terminal `foregroundColor` and
@@ -248,7 +302,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     /// Controls weather to use high ansi colors, if false terminal will use bold text instead of high ansi colors
-    public var useBrightColors: Bool = true
+    public var useBrightColors: Bool = true {
+        didSet {
+            if oldValue != useBrightColors {
+                invalidateLineRenderCache()
+            }
+        }
+    }
     
     /// Controls the color for the caret
     public var caretColor: NSColor {
@@ -367,6 +427,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func bufferActivated(source: Terminal) {
+        invalidateLineRenderCache()
         updateScroller ()
     }
     
@@ -899,6 +960,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func selectionChanged(source: Terminal) {
+        selectionGeneration &+= 1
         needsDisplay = true
     }
     
@@ -943,13 +1005,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return terminal.encodeButton(button: event.buttonNumber, release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
     }
     
-    func calculateMouseHit (with event: NSEvent) -> (grid: Position, pixels: Position)
+    func calculateMouseHit (with event: NSEvent) -> (grid: Position, viewport: Position, pixels: Position)
     {
         let point = convert(event.locationInWindow, from: nil)
         return calculateMouseHit(at: point)
     }
 
-    func calculateMouseHit (at point: CGPoint) -> (grid: Position, pixels: Position)
+    func calculateMouseHit (at point: CGPoint) -> (grid: Position, viewport: Position, pixels: Position)
     {
         func toInt (_ p: NSPoint) -> Position {
 
@@ -960,16 +1022,26 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let col = Int (point.x / cellDimension.width)
         let row = Int ((frame.height-point.y) / cellDimension.height)
         if row < 0 {
-            return (Position(col: 0, row: 0), toInt (point))
+            let baseRow = max(0, terminal?.buffer.yDisp ?? 0)
+            let clippedCol = min(max(0, col), max((terminal?.cols ?? 1) - 1, 0))
+            let viewport = Position(col: clippedCol, row: 0)
+            return (Position(col: clippedCol, row: baseRow), viewport, toInt (point))
         }
-        return (Position(col: min (max (0, col), terminal.cols-1), row: row), toInt (point))
+        let clippedCol = min (max (0, col), max ((terminal?.cols ?? 1) - 1, 0))
+        let viewportRow = max(0, row)
+        if let terminal {
+            let bufferRow = min (max (terminal.buffer.yDisp + viewportRow, 0), max (terminal.buffer.lines.count - 1, 0))
+            return (Position(col: clippedCol, row: bufferRow), Position(col: clippedCol, row: viewportRow), toInt(point))
+        }
+        return (Position(col: clippedCol, row: viewportRow), Position(col: clippedCol, row: viewportRow), toInt(point))
     }
     
     private func sharedMouseEvent (with event: NSEvent)
     {
         let hit = calculateMouseHit(with: event)
         let buttonFlags = encodeMouseEvent(with: event)
-        terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: hit.grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+        let viewportRow = max(0, min(terminal.rows-1, hit.viewport.row))
+        terminal.sendEvent(buttonFlags: buttonFlags, x: hit.viewport.col, y: viewportRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
     }
     
     private var autoScrollDelta = 0
@@ -992,32 +1064,34 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
         
-        let hit = calculateMouseHit(with: event).grid
-        
+        let hit = calculateMouseHit(with: event)
+        let viewport = hit.viewport
+        let bufferHit = hit.grid
+
         switch event.clickCount {
         case 1:
             if selection.active == true {
                 if event.modifierFlags.contains(.shift) {
-                    selection.shiftExtend(row: hit.row, col: hit.col)
+                    selection.shiftExtend(row: viewport.row, col: viewport.col)
                 } else {
                     selection.active = false
                 }
             }
         case 2:
-            selection.selectWordOrExpression(at: Position(col: hit.col, row: hit.row + terminal.buffer.yDisp), in: terminal.buffer)
+            selection.selectWordOrExpression(at: bufferHit, in: terminal.buffer)
             
         default:
             // 3 and higher
             
-            selection.select(row: hit.row + terminal.buffer.yDisp)
+            selection.select(row: bufferHit.row)
         }
         setNeedsDisplay(bounds)
     }
-    
+
     func getPayload (for event: NSEvent) -> Any?
     {
         let hit = calculateMouseHit(with: event).grid
-        let cd = terminal.buffer.lines [terminal.buffer.yDisp+hit.row][hit.col]
+        let cd = terminal.buffer.lines [hit.row][hit.col]
         return cd.getPayload()
     }
     
@@ -1046,13 +1120,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func mouseDragged(with event: NSEvent) {
         let mouseHit = calculateMouseHit(with: event)
-        let hit = mouseHit.grid
+        let viewportHit = mouseHit.viewport
         if allowMouseReporting {
             if terminal.mouseMode.sendMotionEvent() {
                 let flags = encodeMouseEvent(with: event)
-            
-                terminal.sendMotion(buttonFlags: flags, x: hit.col, y: hit.row, pixelX: mouseHit.pixels.col, pixelY: mouseHit.pixels.row)
-            
+
+                let viewportRow = max(0, min(terminal.rows-1, viewportHit.row))
+                terminal.sendMotion(buttonFlags: flags, x: viewportHit.col, y: viewportRow, pixelX: mouseHit.pixels.col, pixelY: mouseHit.pixels.row)
+
                 return
             }
             if terminal.mouseMode != .off {
@@ -1061,17 +1136,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
                 
         if selection.active {
-            selection.dragExtend(row: hit.row, col: hit.col)
+            selection.dragExtend(row: viewportHit.row, col: viewportHit.col)
         } else {
-            selection.startSelection(row: hit.row, col: hit.col)
+            selection.startSelection(row: viewportHit.row, col: viewportHit.col)
         }
         didSelectionDrag = true
         autoScrollDelta = 0
         if selection.active {
-            if hit.row <= 0 {
-                autoScrollDelta = calcScrollingVelocity(delta: hit.row * -1) * -1
-            } else if hit.row >= terminal.rows {
-                autoScrollDelta = calcScrollingVelocity(delta: hit.row - terminal.rows)
+            let viewportRow = viewportHit.row
+            if viewportRow <= 0 {
+                autoScrollDelta = calcScrollingVelocity(delta: abs(viewportRow)) * -1
+            } else if viewportRow >= terminal.rows {
+                autoScrollDelta = calcScrollingVelocity(delta: viewportRow - terminal.rows)
             }
         }
         setNeedsDisplay(bounds)
@@ -1151,7 +1227,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         
         if terminal.mouseMode.sendMotionEvent() {
             let flags = encodeMouseEvent(with: event, overwriteRelease: true)
-            terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: hit.grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+            let viewportRow = max(0, min(terminal.rows-1, hit.viewport.row))
+            terminal.sendMotion(buttonFlags: flags, x: hit.viewport.col, y: viewportRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
     }
     

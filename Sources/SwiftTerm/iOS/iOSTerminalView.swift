@@ -163,6 +163,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var colors: [UIColor?] = Array(repeating: nil, count: 256)
     var trueColors: [Attribute.Color:UIColor] = [:]
     var transparent = TTColor.transparent ()
+    var lineRenderCache: [Int: CachedLine] = [:]
+    var selectionGeneration: UInt64 = 0
+    var glyphWidthCache = GlyphWidthCache(capacity: 8192)
+    var colorMapCache = ColorMapCache(capacity: 4096)
     
     // UITextInput support starts
     public lazy var tokenizer: UITextInputTokenizer = UITextInputStringTokenizer (textInput: self) // TerminalInputTokenizer()
@@ -258,14 +262,24 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         updateDisplay()
     }
 
-    func startDisplayUpdates()
+    public func startDisplayUpdates()
     {
         link.isPaused = false
+        if displayThrottleState.needsFlushWhenResumed {
+            displayThrottleState.needsFlushWhenResumed = false
+            queuePendingDisplay()
+        }
+        displayThrottleState.suspended = false
     }
     
-    func suspendDisplayUpdates()
+    public func suspendDisplayUpdates()
     {
+        displayThrottleState.suspended = true
         link.isPaused = true
+    }
+
+    public func resumeDisplayUpdates() {
+        startDisplayUpdates()
     }
     
     public func updateUiClosed() {
@@ -816,6 +830,22 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     var _nativeFg, _nativeBg: TTColor!
     var settingFg = false, settingBg = false
+    var _displayThrottleState = DisplayThrottleState()
+    var _dirtyRowsToDraw: Set<Int> = []
+    var _lastDrawnYDisp: Int = 0
+    var _renderStats = RenderStats()
+    var _renderInstrumentationEnabled: Bool = false
+    var _lastScrollDeltaRows: Int = 0
+    var _pendingScrollBlitAttempts: Int = 0
+    var _pendingScrollBlitHits: Int = 0
+    var _pendingScrollBlitExposedRows: Int = 0
+    var _renderRebuildLineCount: Int = 0
+    var _renderRebuildCharCount: Int = 0
+    var _renderLogEveryNFrames: Int = 0
+    var _renderLogFrameCounter: Int = 0
+    var _renderLogUsePrint: Bool = false
+    var _lastScrollExposedRows: Int = 0
+    var cachesPrewarmed = false
     /**
      * This will set the native foreground color to the specified native color (UIColor or NSColor)
      * and will have this reflected into the underlying's terminal `foregroundColor` and
@@ -863,7 +893,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     /// Controls weather to use high ansi colors, if false terminal will use bold text instead of high ansi colors
-    public var useBrightColors: Bool = true
+    public var useBrightColors: Bool = true {
+        didSet {
+            if oldValue != useBrightColors {
+                invalidateLineRenderCache()
+            }
+        }
+    }
 
     var _selectedTextBackgroundColor = UIColor (red: 204.0/255.0, green: 221.0/255.0, blue: 237.0/255.0, alpha: 1.0)
     /// The color used to render the selection
@@ -892,6 +928,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var lineLeading: CGFloat = 0
     
     open func bufferActivated(source: Terminal) {
+        invalidateLineRenderCache()
         updateScroller ()
     }
     
@@ -1403,6 +1440,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
 
     open func selectionChanged(source: Terminal) {
+        selectionGeneration &+= 1
         if pendingSelectionChanged {
             return
         }

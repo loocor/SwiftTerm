@@ -347,6 +347,9 @@ open class Terminal {
     
     var refreshStart = Int.max
     var refreshEnd = -1
+    // Track dirty lines in the visible buffer (0-based rows). This enables
+    // finer-grained redraws than the coarse start/end range.
+    private var dirtyLines: Set<Int> = []
     var scrollInvariantRefreshStart = Int.max
     var scrollInvariantRefreshEnd = -1
     var userScrolling = false
@@ -3697,7 +3700,9 @@ open class Terminal {
                 bracketedPasteMode = false
                 break
             default:
-                log ("Unhandled DEC Private Mode Reset (DECRST) with \(par)")
+                if logUnhandledDecModes {
+                    log ("Unhandled DEC Private Mode Reset (DECRST) with \(par)")
+                }
                 break
             }
         }
@@ -3931,7 +3936,9 @@ open class Terminal {
                 // TODO: must implement bracketed paste mode
                 bracketedPasteMode = true
             default:
-                log ("Unhandled DEC Private Mode Set (DECSET) with \(par)")
+                if logUnhandledDecModes {
+                    log ("Unhandled DEC Private Mode Set (DECSET) with \(par)")
+                }
                 break;
             }
         } else {
@@ -4422,11 +4429,12 @@ open class Terminal {
         tdel?.send (source: self, data: buffer[...])
     }
     
-#if DEBUG
-    public var silentLog = false
-#else
+    // Verbose logging is noisy for common-but-unsupported escape sequences (e.g. DECSET 2026).
+    // Default to silent to avoid flooding host apps; toggle manually if deep debugging is needed.
     public var silentLog = true
-#endif
+
+    /// Additional guard for printing unhandled DEC private mode messages.
+    public var logUnhandledDecModes = false
     
     func error (_ text: String)
     {
@@ -4489,33 +4497,35 @@ open class Terminal {
      * scroll-invariant update ranges.
      */
     func updateRange (_ y: Int, scrolling: Bool = false)
-    {        
-        if !scrolling {
-            let effectiveY = buffer.yDisp + y
-            if effectiveY >= 0 {
-                if effectiveY < scrollInvariantRefreshStart {
-                    scrollInvariantRefreshStart = effectiveY
-                }
-                if effectiveY > scrollInvariantRefreshEnd {
-                    scrollInvariantRefreshEnd = effectiveY
-                }
-            }
-        }
-        
-        if y >= 0 {
-            if y < refreshStart {
-                refreshStart = y
-            }
-            if y > refreshEnd {
-                refreshEnd = y
-            }
-        }
+    {
+        updateRange(startLine: y, endLine: y, scrolling: scrolling)
     }
     
     func updateRange (startLine: Int, endLine: Int, scrolling: Bool = false)
     {
-        updateRange (startLine, scrolling: scrolling)
-        updateRange (endLine, scrolling: scrolling)
+        let rawStart = min(startLine, endLine)
+        let rawEnd = max(startLine, endLine)
+        let start = max(0, rawStart)
+        let end = max(start, rawEnd)
+
+        if !scrolling {
+            let effectiveStart = buffer.yDisp + start
+            let effectiveEnd = buffer.yDisp + end
+            if effectiveStart < scrollInvariantRefreshStart {
+                scrollInvariantRefreshStart = effectiveStart
+            }
+            if effectiveEnd > scrollInvariantRefreshEnd {
+                scrollInvariantRefreshEnd = effectiveEnd
+            }
+        }
+        
+        if start < refreshStart {
+            refreshStart = start
+        }
+        if end > refreshEnd {
+            refreshEnd = end
+        }
+        dirtyLines.formUnion(start...end)
     }
     
     public func updateFullScreen ()
@@ -4544,6 +4554,11 @@ open class Terminal {
         }
         //print ("Update: \(refreshStart) \(refreshEnd)")
         return (refreshStart, refreshEnd)
+    }
+
+    /// Returns the set of dirty line indices (0-based, visible buffer). Empty if none.
+    public func changedLines() -> Set<Int> {
+        return dirtyLines
     }
 
     /**
@@ -4610,6 +4625,7 @@ open class Terminal {
     {
         refreshStart = Int.max
         refreshEnd = -1
+        dirtyLines.removeAll()
         
         scrollInvariantRefreshStart = Int.max
         scrollInvariantRefreshEnd = -1
