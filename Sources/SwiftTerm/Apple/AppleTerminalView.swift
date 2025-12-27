@@ -152,7 +152,7 @@ struct ColorMapCache {
 
 extension TerminalView {
     typealias CellDimension = CGSize
-    
+
     // When true, queuePendingDisplay will avoid scheduling a redraw and mark
     // needsFlushWhenResumed to repaint once resumed.
     var displayThrottleState: DisplayThrottleState {
@@ -225,7 +225,7 @@ extension TerminalView {
         get { _renderLogUsePrint }
         set { _renderLogUsePrint = newValue }
     }
-    
+
     // Track last drawn yDisp to detect scrolling and fall back to full redraw for new viewport.
     var lastDrawnYDisp: Int {
         get { _lastDrawnYDisp }
@@ -368,7 +368,7 @@ extension TerminalView {
             lineRenderCache.removeValue(forKey: key)
         }
     }
-    
+
     // This is invoked when the font changes to recompute state
     func resetFont()
     {
@@ -379,29 +379,29 @@ extension TerminalView {
         resize(cols: newCols, rows: newRows)
         updateCaretView()
     }
-    
+
     func updateCaretView ()
     {
         guard let caretView else { return }
         caretView.frame.size = CGSize(width: cellDimension.width, height: cellDimension.height)
         caretView.updateCursorStyle()
     }
-    
+
     /// The frame used by the caretView
     public var caretFrame: CGRect {
         return caretView?.frame ?? CGRect.zero
     }
-    
+
     func setupOptions(width: CGFloat, height: CGFloat)
     {
         resetCaches ()
         // Calculation assume that all glyphs in the font have the same advancement.
         // Get the ascent + descent + leading from the font, already scaled for the font's size
         self.cellDimension = computeFontDimensions ()
-        
+
         let terminalOptions = TerminalOptions(cols: Int(width / cellDimension.width),
                                               rows: Int(height / cellDimension.height))
-        
+
         if terminal == nil {
             terminal = Terminal(delegate: self, options: terminalOptions)
         } else {
@@ -412,7 +412,7 @@ extension TerminalView {
         terminal.foregroundColor = Color.defaultForeground
 
         selection = SelectionService(terminal: terminal)
-        
+
         // Install carret view
         if caretView == nil {
             let v = CaretView(frame: CGRect(origin: .zero, size: CGSize(width: cellDimension.width, height: cellDimension.height)), cursorStyle: terminal.options.cursorStyle, terminal: self)
@@ -421,9 +421,9 @@ extension TerminalView {
         } else {
             updateCaretView ()
         }
-        
+
         search = SearchService (terminal: terminal)
-        
+
         #if os(macOS)
         needsDisplay = true
         #else
@@ -436,31 +436,31 @@ extension TerminalView {
     {
         return terminal
     }
-    
+
     /// This function computes the new columns and rows for the terminal when a pixel-size changes
     /// Returns true if this changed the number of columns/rows, false otherwise
     @discardableResult
     func processSizeChange (newSize: CGSize) -> Bool {
         let newRows = Int (newSize.height / cellDimension.height)
         let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
-        
+
         if newCols != terminal.cols || newRows != terminal.rows {
             selection.active = false
             terminal.resize (cols: newCols, rows: newRows)
-            
+
             // These used to be outside
             accessibility.invalidate ()
             search.invalidate ()
-            
+
             terminalDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
-           
+
             updateScroller()
             invalidateLineRenderCache()
             return true
         }
         return false
     }
-    
+
     // Computes the font dimensions once font.normal has been set
     func computeFontDimensions () -> CellDimension
     {
@@ -488,7 +488,7 @@ extension TerminalView {
         #endif
         return CellDimension(width: max (1, cellWidth), height: max (min (cellHeight, 8192), 1))
     }
-    
+
     func mapColor (color: Attribute.Color, isFg: Bool, isBold: Bool, useBrightColors: Bool = true) -> TTColor
     {
         let key = ColorMapCacheKey(color: color, isFg: isFg, isBold: isBold, useBrightColors: useBrightColors)
@@ -536,22 +536,22 @@ extension TerminalView {
         urlAttributes = [:]
         attributes = [:]
         colorMapCache.reset()
-        
+
         terminal.updateFullScreen ()
         invalidateLineRenderCache()
         queuePendingDisplay()
     }
-    
+
     public func hostCurrentDirectoryUpdated (source: Terminal)
     {
         terminalDelegate?.hostCurrentDirectoryUpdate(source: self, directory: terminal.hostCurrentDirectory)
     }
 
-    
+
     /// Installs the new colors as the default colors and recomputes the
     /// current and ansi palette.   This installs both the colors into the terminal
     /// engine and updates the UI accordingly.
-    /// 
+    ///
     /// - Parameter colors: this should be an array of 16 values that correspond to the 16 ANSI colors,
     /// if the array does not contain 16 elements, it will not do anything
     public func installColors (_ colors: [Color])
@@ -560,7 +560,7 @@ extension TerminalView {
         self.colors = Array(repeating: nil, count: 256)
         self.colorsChanged()
     }
-    
+
     public func colorChanged (source: Terminal, idx: Int?)
     {
         if let index = idx {
@@ -576,12 +576,12 @@ extension TerminalView {
         nativeBackgroundColor = TTColor.make (color: color)
         colorsChanged()
     }
-    
+
     public func setForegroundColor(source: Terminal, color: Color) {
         nativeForegroundColor = TTColor.make (color: color)
         colorsChanged()
     }
-    
+
     /// Sets the color for the cursor block, and the text when it is under that cursor in block mode
     public func setCursorColor(source: Terminal, color: Color?, textColor: Color?) {
         if let setColor = color {
@@ -599,17 +599,17 @@ extension TerminalView {
             }
         }
     }
-    
+
     func getAttributedValue (_ attribute: Attribute, usingFg: TTColor, andBg: TTColor) -> [NSAttributedString.Key:Any]?
     {
         let flags = attribute.style
         var bg = andBg
         var fg = usingFg
-        
+
         if flags.contains (.inverse) {
             swap (&bg, &fg)
         }
-        
+
         var tf: TTFont
         let isBold = flags.contains(.bold)
         if isBold {
@@ -623,7 +623,7 @@ extension TerminalView {
         } else {
             tf = fontSet.normal
         }
-        
+
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fg,
@@ -639,7 +639,7 @@ extension TerminalView {
         }
         return nsattr
     }
-    
+
     //
     // Given a vt100 attribute, return the NSAttributedString attributes used to render it
     //
@@ -648,10 +648,10 @@ extension TerminalView {
         let flags = attribute.style
         var bg = attribute.bg
         var fg = attribute.fg
-        
+
         if flags.contains (.inverse) {
             swap (&bg, &fg)
-            
+
             if fg == .defaultColor {
                 fg = .defaultInvertedColor
             }
@@ -659,11 +659,11 @@ extension TerminalView {
                 bg = .defaultInvertedColor
             }
         }
-        
+
         if let result = withUrl ? urlAttributes [attribute] : attributes [attribute] {
             return result
         }
-        
+
         var useBoldForBrightColor: Bool = false
         // if high - bright colors are disabled in settings we will use bold font instead
         if case .ansi256(let code) = fg, code > 7, !useBrightColors {
@@ -671,7 +671,7 @@ extension TerminalView {
         }
         var tf: TTFont
         let isBold = flags.contains(.bold)
-        
+
         if isBold || useBoldForBrightColor {
             if flags.contains (.italic) {
                 tf = fontSet.boldItalic
@@ -683,7 +683,7 @@ extension TerminalView {
         } else {
             tf = fontSet.normal
         }
-        
+
         let fgColor = mapColor (color: fg, isFg: true, isBold: isBold, useBrightColors: useBrightColors)
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
@@ -702,7 +702,7 @@ extension TerminalView {
         if withUrl {
             nsattr [.underlineStyle] = NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDash.rawValue
             nsattr [.underlineColor] = fgColor
-            
+
             // Add to cache
             urlAttributes [attribute] = nsattr
         } else {
@@ -711,7 +711,7 @@ extension TerminalView {
         }
         return nsattr
     }
-    
+
     //
     // Given a line of text with attributes, returns the NSAttributedString, suitable to be drawn
     // as a side effect, it updates the `images` array
@@ -762,7 +762,7 @@ extension TerminalView {
             }
             hasActiveRun = true
         }
-        
+
         while col < cols {
             let ch: CharData = line[col]
             let chHasUrl = ch.hasPayload
@@ -805,7 +805,7 @@ extension TerminalView {
         updateSelectionAttributesIfNeeded(attributedLine: res, row: row, cols: cols)
         return ViewLineInfo(attrStr: res, images: line.images)
     }
-    
+
     /// Apply selection attributes
     /// TODO: Optimize the logic below
     func updateSelectionAttributesIfNeeded(attributedLine attributedString: NSMutableAttributedString, row: Int, cols: Int) {
@@ -816,10 +816,10 @@ extension TerminalView {
 
         let startRow = selection.start.row
         let endRow = selection.end.row
-        
+
         let startCol = selection.start.col
         let endCol = selection.end.col
-        
+
         var selectionRange: NSRange = .empty
 
         // single row
@@ -835,36 +835,36 @@ extension TerminalView {
             if startRow == row && endRow > row {
                 selectionRange = NSRange(location: startCol, length: cols - startCol)
             }
-            
+
             // in between
             if startRow < row && endRow > row {
                 selectionRange = NSRange(location: 0, length: cols)
             }
-            
+
             // last row
             if startRow < row && endRow == row {
                 let extra = endCol == terminal.cols-1 ? 1 : 0
                 selectionRange = NSRange(location: 0, length: endCol + extra)
             }
         } else if endRow < startRow {
-            
+
             // first row
             if endRow == row && startRow > row {
                 selectionRange = NSRange(location: endCol, length: cols - endCol)
             }
-            
+
             // in between
             if startRow > row && endRow < row {
                 selectionRange = NSRange(location: 0, length: cols)
             }
-            
+
             // last row
             if endRow < row && startRow == row {
                 let extra = startCol == terminal.cols-1 ? 1 : 0
                 selectionRange = NSRange(location: 0, length: startCol + extra)
             }
         }
-        
+
         if selectionRange != .empty {
             assert (selectionRange.location >= 0)
             // Looks like we can start the selection range beyond the boundary and it wont be a problem
@@ -940,7 +940,7 @@ extension TerminalView {
         currentContext.restoreGState()
     }
 
-    
+
     // TODO: this should not render any lines outside the dirtyRect
     func drawTerminalContents (dirtyRect: TTRect, context: CGContext, bufferOffset: Int)
     {
@@ -1039,7 +1039,7 @@ extension TerminalView {
             let renderMode = terminal.buffer.lines [row].renderMode
             let lineOffset = calcLineOffset(forRow: row)
             let lineOrigin = CGPoint(x: 0, y: frame.height - lineOffset)
-            
+
             switch renderMode {
             case .single:
                 break
@@ -1062,7 +1062,7 @@ extension TerminalView {
                 let lineRect = CGRect (origin: CGPoint (x: 0, y: lineOrigin.y), size: CGSize (width: dirtyRect.width, height: cellDimension.height))
 
                 context.clip(to: [lineRect])
-                
+
                 // Debug Aid
                 //context.setFillColor(CGColor(red: Double (row)/25.0, green: 0, blue: 0, alpha: 1))
                 //context.fill([lineRect])
@@ -1070,7 +1070,7 @@ extension TerminalView {
                 context.translateBy(x: 0, y: pivot)
                 context.scaleBy (x: 2, y: 2)
                 context.translateBy(x: 0, y: -pivot)
-                
+
             case .doubleWidth:
                 context.saveGState()
                 context.scaleBy (x: 2, y: 1)
@@ -1081,13 +1081,13 @@ extension TerminalView {
             // a case where we just get full exposes despite requesting only a line
             // repro: fill 300 lines, then clear screen then repeatedly output commands
             // that produce 3-5 lines of text: while we send AppKit the right boundary,
-            // AppKit still send everything.  
+            // AppKit still send everything.
             let lineRect = CGRect (origin: lineOrigin, size: CGSize (width: dirtyRect.width, height: cellDimension.height))
-            
+
             if !lineRect.intersects(dirtyRect) {
                 //print ("Skipping row \(row) because it does nto intersect")
                 continue
-            } 
+            }
             #endif
             let line = terminal.buffer.lines [row]
             let cacheEntry: CachedLine
@@ -1162,7 +1162,7 @@ extension TerminalView {
                     if col + runGlyphsCount >= terminal.cols {
                         size.width += frame.width - size.width
                     }
-                    
+
                     let rect = CGRect (origin: origin, size: size)
                     #if os(macOS)
                     rect.applying(transform).fill(using: .destinationOver)
@@ -1182,7 +1182,7 @@ extension TerminalView {
                     }
                     context.setFillColor(cgColor)
                 }
-                
+
                 CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
 
                 // Draw other attributes
@@ -1203,7 +1203,7 @@ extension TerminalView {
                                       y: rowBase - CGFloat (image.pixelHeight),
                                       width: CGFloat (image.pixelWidth),
                                       height: CGFloat (image.pixelHeight))
-                    
+
                     image.image.draw (in: rect)
                 }
             }
@@ -1234,7 +1234,7 @@ extension TerminalView {
         lastScrollExposedRows = 0
 
         pruneLineRenderCache(visibleStart: bufferOffset, visibleEnd: bufferOffset + terminal.rows)
-        
+
 #if os(macOS)
         // Fills gaps at the end with the default terminal background
         let box = CGRect (x: 0, y: 0, width: bounds.width, height: bounds.height.truncatingRemainder(dividingBy: cellHeight))
@@ -1255,7 +1255,7 @@ extension TerminalView {
             context.fill ([inter])
         }
 #endif
-        
+
 #if os(iOS) || os(visionOS)
         if selection.active {
             let start, end: Position
@@ -1263,18 +1263,18 @@ extension TerminalView {
             func drawSelectionHandle (drawStart: Bool, row: Int) {
                 let lineOffset = calcLineOffset(forRow: row)
                 let lineOrigin = frame.height - lineOffset
-                
+
                 context.saveGState ()
                 let start = CGPoint (
                     x: CGFloat (drawStart ? start.col : end.col) * cellDimension.width,
                     y: lineOrigin)
                 let end = CGPoint(x: start.x, y: start.y + cellDimension.height)
-                
+
                 context.move(to: end)
                 context.addLine(to: start)
                 let size = 6.0
                 let location = drawStart ? end : start
-                
+
                 let rect = CGRect (origin:
                                     CGPoint (x: location.x-(size/2.0),
                                              y: location.y - (drawStart ? 0.0 : size)),
@@ -1287,7 +1287,7 @@ extension TerminalView {
                 context.drawPath(using: .fillStroke)
                 context.restoreGState()
             }
-            
+
             // Normalize the selection start/end, regardless of where it started
             let sstart = selection.start
             let send = selection.end
@@ -1298,13 +1298,13 @@ extension TerminalView {
                 start = send
                 end = sstart
             }
-            
+
             drawSelectionHandle (drawStart: true, row: start.row)
             drawSelectionHandle (drawStart: false, row: end.row)
         }
 #endif
     }
-    
+
     /// Update visible area
     func updateDisplay (notifyAccessibility: Bool)
     {
@@ -1325,80 +1325,20 @@ extension TerminalView {
         let dirtyRowsSet = terminal.changedLines()
         dirtyRowsToDraw = dirtyRowsSet
 
-        let shouldForceFullRedraw: Bool = {
-            guard !dirtyRowsSet.isEmpty else { return false }
-            guard let minRow = dirtyRowsSet.min(), let maxRow = dirtyRowsSet.max() else { return false }
-            let span = maxRow - minRow + 1
-            let minSpan = max(terminal.rows / 2, 6)
-            let maxSparseCount = max(span / 4, 4)
-            return span >= minSpan && dirtyRowsSet.count <= maxSparseCount
-        }()
+                terminal.clearUpdateRange ()
 
-        terminal.clearUpdateRange ()
-        if shouldForceFullRedraw {
-            dirtyRowsToDraw = []
-            #if os(macOS)
-            setNeedsDisplay(bounds)
-            #else
-            setNeedsDisplay(frame)
-            #endif
-            return
-        }
-                
-        #if os(macOS)
-        let baseLine = frame.height
-        if dirtyRowsSet.isEmpty {
-            var region = CGRect (x: 0,
-                                 y: baseLine - (cellDimension.height + CGFloat(rowEnd) * cellDimension.height),
-                                 width: frame.width,
-                                 height: CGFloat(rowEnd-rowStart + 1) * cellDimension.height)
-            
-            // If we are the last line, we should also queue a refresh for the "remaining" bits at the
-            // end which can be redrawn by large unicode
-            if rowEnd == terminal.rows - 1 {
-                let oh = region.height
-                let oy = region.origin.y
-                region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
-            }
-            setNeedsDisplay(region)
-        } else {
-            let sorted = dirtyRowsSet.sorted()
-            var runStart = sorted.first!
-            var runEnd = runStart
+                // For embedded terminal use case, always force full visible area redraw to ensure consistency
+                // This prevents issues with incomplete redraws when terminal receives batch data
+                dirtyRowsToDraw = []
+                #if os(macOS)
+                setNeedsDisplay(bounds)
+                #else
+                setNeedsDisplay(frame)
+                #endif
 
-            func enqueueRegion(start: Int, end: Int) {
-                var region = CGRect(x: 0,
-                                    y: baseLine - (cellDimension.height + CGFloat(end) * cellDimension.height),
-                                    width: frame.width,
-                                    height: CGFloat(end - start + 1) * cellDimension.height)
-                if end == terminal.rows - 1 {
-                    let oh = region.height
-                    let oy = region.origin.y
-                    region = CGRect(x: 0, y: 0, width: frame.width, height: oh + oy)
-                }
-                setNeedsDisplay(region)
-            }
+                pendingDisplay = false
+                updateDebugDisplay()
 
-            for row in sorted.dropFirst() {
-                if row == runEnd + 1 {
-                    runEnd = row
-                } else {
-                    enqueueRegion(start: runStart, end: runEnd)
-                    runStart = row
-                    runEnd = row
-                }
-            }
-            enqueueRegion(start: runStart, end: runEnd)
-        }
-        #else
-        // TODO iOS: need to update the code above, but will do that when I get some real
-        // life data being fed into it.
-        setNeedsDisplay(bounds)
-        #endif
-        
-        pendingDisplay = false
-        updateDebugDisplay ()
-        
         if (notifyAccessibility) {
             accessibility.invalidate ()
             #if os(macOS)
@@ -1407,7 +1347,7 @@ extension TerminalView {
             #endif
         }
     }
-    
+
     func updateCursorPosition()
     {
         guard let caretView else { return }
@@ -1415,7 +1355,7 @@ extension TerminalView {
         //caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * CGFloat(terminal.buffer.x)), y: lineOrigin.y)
         let buffer = terminal.buffer
         let vy = buffer.yBase + buffer.y
-        
+
         if vy >= buffer.yDisp + buffer.rows {
             caretView.removeFromSuperview()
             return
@@ -1433,7 +1373,7 @@ extension TerminalView {
         caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
         caretView.setText (ch: buffer.lines [vy][buffer.x])
     }
-    
+
     // Does not use a default argument and merge, because it is called back
     func updateDisplay ()
     {
@@ -1441,7 +1381,7 @@ extension TerminalView {
         updateDebugDisplay()
         pendingDisplay = false
     }
-    
+
     //
     // The code below is intended to not repaint too often, which can produce flicker, for example
     // when the user refreshes the display, and this repains the screen, as dispatch delivers data
@@ -1470,7 +1410,7 @@ extension TerminalView {
     public func requestDisplayRefresh() {
         queuePendingDisplay()
     }
-    
+
     ///
     /// This takes a string returned by events (NSEvent or UIKey) as the 'charactersIngoringModifiers'
     /// and returns the control-version of that, and only applies to a handful of characters
@@ -1513,13 +1453,13 @@ extension TerminalView {
             if terminal.isCurrentBufferAlternate {
                 return 0
             }
-            
+
             // the thumb size is the proportion of the visible content of the
             // entire content but don't make it too small
             return max (CGFloat (terminal.rows) / CGFloat (terminal.buffer.lines.count), 0.01)
         }
     }
-    
+
     /**
      * Gets a value indicating the relative position of the terminal viewport
      */
@@ -1528,16 +1468,16 @@ extension TerminalView {
             if terminal.isCurrentBufferAlternate || terminal.buffer.yDisp <= 0 {
                 return 0
             }
-            
+
             let maxScrollback = terminal.buffer.lines.count - terminal.rows
             if terminal.buffer.yDisp >= maxScrollback {
                 return 1
             }
-            
+
             return Double (terminal.buffer.yDisp) / Double (maxScrollback)
         }
     }
-    
+
     /// <summary>
     /// Gets a value indicating whether or not the user can scroll the terminal contents
     /// </summary>
@@ -1556,55 +1496,23 @@ extension TerminalView {
         pendingScrollBlitAttempts &+= 1
         lastScrollExposedRows = 0
         #if os(macOS)
-        guard deltaRows != 0 else { return false }
-        let rowsToMove = abs(deltaRows)
-        let maxBlitRows = max(terminal.rows * 3, terminal.rows)
-        if rowsToMove > maxBlitRows {
-            return false
-        }
-        let dy = CGFloat(deltaRows) * cellDimension.height
-        if dy == 0 || bounds.isEmpty {
-            return false
-        }
-
-        scroll(bounds, by: NSSize(width: 0, height: dy))
-
-        let exposedHeight = min(abs(dy), bounds.height)
-        if exposedHeight == 0 {
-            return true
-        }
-        let exposedRows = min(terminal.rows, Int(ceil(exposedHeight / cellDimension.height)))
-        let exposedRect: CGRect
-        let startRow: Int
-        if dy > 0 {
-            exposedRect = CGRect(x: 0, y: 0, width: bounds.width, height: exposedHeight)
-            startRow = max(terminal.rows - exposedRows, 0)
-        } else {
-            exposedRect = CGRect(x: 0, y: bounds.height - exposedHeight, width: bounds.width, height: exposedHeight)
-            startRow = 0
-        }
-        setNeedsDisplay(exposedRect)
-        if exposedRows > 0 {
-            terminal.refresh(startRow: startRow, endRow: startRow + exposedRows - 1)
-        }
-        pendingScrollBlitHits &+= 1
-        pendingScrollBlitExposedRows &+= exposedRows
-        lastScrollExposedRows = exposedRows
-        return true
+        // Manual blitting with scroll(_:by:) is deprecated in macOS 10.14+ and discouraged for layer-backed views.
+        // We return false to fall back to the standard redraw path (setNeedsDisplay), which is performant enough on modern hardware.
+        return false
         #else
         return false
         #endif
     }
-    
+
     public func scroll (toPosition: Double)
     {
         userScrolling = true
         let oldPosition = terminal.buffer.yDisp
-        
+
         let maxScrollback = terminal.buffer.lines.count - terminal.rows
         print ("maxScrollBack: \(maxScrollback)")
         var newScrollPosition = Int (Double (maxScrollback) * toPosition)
-        
+
         if newScrollPosition < 0 {
             newScrollPosition = 0
         }
@@ -1612,13 +1520,13 @@ extension TerminalView {
             newScrollPosition = maxScrollback
         }
         print ("newScrollpsitin: \(newScrollPosition)")
-        
+
         if newScrollPosition != oldPosition {
             scrollTo(row: newScrollPosition)
         }
         userScrolling = false
     }
-    
+
     func scrollTo (row: Int, notifyAccessibility: Bool = true)
     {
         if row != terminal.buffer.yDisp {
@@ -1639,7 +1547,7 @@ extension TerminalView {
             }
         }
     }
-    
+
     /// Scrolls the content of the terminal one page up
     public func pageUp()
     {
@@ -1649,7 +1557,7 @@ extension TerminalView {
             scrollUp (lines: terminal.rows)
         }
     }
-    
+
     /// Scrolls the content of the terminal one page down
     public func pageDown ()
     {
@@ -1659,34 +1567,34 @@ extension TerminalView {
             scrollDown (lines: terminal.rows)
         }
     }
-    
+
     /// Scrolls up the content of the terminal the specified number of lines
     public func scrollUp (lines: Int)
     {
         let newPosition = max (terminal.buffer.yDisp - lines, 0)
         scrollTo (row: newPosition)
     }
-    
+
     /// Scrolls down the content of the terminal the specified number of lines
     public func scrollDown (lines: Int)
     {
         let newPosition = max (0, min (terminal.buffer.yDisp + lines, terminal.buffer.lines.count - terminal.rows))
         scrollTo (row: newPosition)
     }
-      
+
     func feedPrepare()
     {
         search.invalidate()
         selection.active = false
         startDisplayUpdates()
     }
-    
+
     func feedFinish ()
     {
         suspendDisplayUpdates ()
         queuePendingDisplay()
     }
-    
+
     /// Sends data to the terminal emulator for interpretation, this can be invoked from a background thread
     public func feed (byteArray: ArraySlice<UInt8>)
     {
@@ -1694,7 +1602,7 @@ extension TerminalView {
         terminal.feed (buffer: byteArray)
         feedFinish()
     }
-    
+
     /// Sends data to the terminal emulator for interpretation, this can be invoked from a background thread
     public func feed (text: String)
     {
@@ -1702,7 +1610,7 @@ extension TerminalView {
         terminal.feed (text: text)
         feedFinish()
     }
-         
+
     /**
      * Triggers a resize of the underlying terminal to the desired columsn and rows
      */
@@ -1712,7 +1620,7 @@ extension TerminalView {
         sizeChanged (source: terminal)
         terminal.softReset()
     }
-    
+
     /**
      * Sends the specified slice of byte arrays to the program running under the terminal emulator
      * - Parameter data: the slice of an array to send to the client
@@ -1722,7 +1630,7 @@ extension TerminalView {
         ensureCaretIsVisible ()
         terminalDelegate?.send (source: self, data: data)
     }
-    
+
     /**
      * Sends the specified string encoded at utf8 to the program running under the terminal emulator
      * - Parameter txt: the string to send to the client
@@ -1731,7 +1639,7 @@ extension TerminalView {
         let array = [UInt8] (txt.utf8)
         send (data: array[...])
     }
-    
+
     /**
      * Sends the specified array of bytes to the program running under the terminal emulator
      * - Parameter bytes: the bytes to send to the client
@@ -1739,33 +1647,33 @@ extension TerminalView {
     public func send (_ bytes: [UInt8]) {
         send (data: (bytes)[...])
     }
-    
+
     func sendKeyUp ()
     {
         send (terminal.applicationCursor ? EscapeSequences.moveUpApp : EscapeSequences.moveUpNormal)
     }
-    
+
     func sendKeyDown ()
     {
         send (terminal.applicationCursor ? EscapeSequences.moveDownApp : EscapeSequences.moveDownNormal)
     }
-    
+
     func sendKeyLeft()
     {
         send (terminal.applicationCursor ? EscapeSequences.moveLeftApp : EscapeSequences.moveLeftNormal)
     }
-    
+
     func sendKeyRight ()
     {
         send (terminal.applicationCursor ? EscapeSequences.moveRightApp : EscapeSequences.moveRightNormal)
     }
-    
+
     class AppleImage: TerminalImage {
         var image: TTImage
         var pixelWidth: Int
         var pixelHeight: Int
         var col: Int
-        
+
         init (image: TTImage, width: Int, height: Int, onCol: Int) {
             self.image = image
             self.pixelWidth = width
@@ -1778,7 +1686,7 @@ extension TerminalView {
         return (cols: Int ((size.width+cellDimension.width-1)/cellDimension.width),
                 rows: Int ((size.height+cellDimension.height-1)/cellDimension.height))
     }
-    
+
     public func createImageFromBitmap(source: Terminal, bytes: inout [UInt8], width: Int, height: Int) {
         let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo: CGBitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
@@ -1793,11 +1701,11 @@ extension TerminalView {
                 intent: .defaultIntent) else {
             return
         }
-        
+
         let image = TTImage (cgImage: cgimage, size: CGSize (width: width, height: height))
         insertImage (image, width: CGFloat (width) > frame.width ? .percent(100) : .auto, height: .auto, preserveAspectRatio: true)
     }
-   
+
     public func createImage (source: Terminal, data: Data, width widthRequest: ImageSizeRequest, height heightRequest: ImageSizeRequest, preserveAspectRatio: Bool)
     {
         guard let img = TTImage(data: data) else {
@@ -1805,7 +1713,7 @@ extension TerminalView {
         }
         insertImage (img, width: widthRequest, height: heightRequest, preserveAspectRatio: preserveAspectRatio)
     }
-    
+
     // Inserts the specified image at the current buffer position (x, y) using the specified size requests
     // and aspect ratio request.   The insertion is done by adding slices of the image, one per line
     // to the buffer.
@@ -1814,7 +1722,7 @@ extension TerminalView {
         let buffer = terminal.buffer
         var img = image
         let displayScale = getImageScale ()
-        
+
         // Converts a size request in a single dimension into an absolute pixel value, where
         // the `dim` is the request, `regionSize` is the available view space, and `imageSize` is
         // the size of the image along the dimension being requested
@@ -1830,10 +1738,10 @@ extension TerminalView {
                 return CGFloat (pct) * 0.01 * regionSize
             }
         }
-        
+
         var width = getPixels (fromDim: widthRequest, regionSize: frame.width, imageSize: img.size.width, cellSize: cellDimension.width)
         var height = getPixels (fromDim: heightRequest, regionSize: frame.height, imageSize: img.size.height, cellSize: cellDimension.height)
-        
+
         if preserveAspectRatio {
             switch (widthRequest, heightRequest) {
             case (.auto, .auto):
@@ -1846,16 +1754,16 @@ extension TerminalView {
                 img = scale (image: img, size: CGSize (width: width, height: height))
             }
         }
-        
+
         let rows = Int (ceil (height/cellDimension.height))
-        
+
         let stripeSize = CGSize (width: width, height: cellDimension.height)
         #if os(iOS) || os(visionOS)
         var srcY: CGFloat = 0
         #else
         var srcY: CGFloat = img.size.height
         #endif
-        
+
         let heightRatio = img.size.height/height
         for _ in 0..<rows {
             #if os(macOS)
@@ -1867,13 +1775,13 @@ extension TerminalView {
             #if os(iOS) || os(visionOS)
             srcY += cellDimension.height * heightRatio
             #endif
-            
+
             let attachedImage = AppleImage (image: stripe, width: Int (stripeSize.width), height: Int (cellDimension.height), onCol: terminal.buffer.x)
-            
+
             buffer.lines [buffer.y+buffer.yBase].attach(image: attachedImage)
 
             terminal.updateRange (buffer.y)
-            
+
             // The buffer.x position would have changed depending on the lineFeedMode (LNM)
             // for image rendering, we want the x to remain the same
             let savedX = buffer.x
@@ -1881,15 +1789,15 @@ extension TerminalView {
             buffer.x = savedX
         }
     }
-    
+
     /// Set to true if the selection is active, false otherwise
     public var selectionActive: Bool {
         get {
             selection.active
         }
     }
-    
-    
+
+
     /// Returns the contents of the selection, if active, or nil otherwise
     public func getSelection () -> String?
     {
@@ -1898,16 +1806,16 @@ extension TerminalView {
         }
         return nil
     }
-    
+
     /// Selects the entire buffer
     public func selectAll () {
         selection.selectAll()
     }
-    
+
     /// Clears the selection
     public func selectNone () {
         selection.selectNone()
     }
-    
+
 }
 #endif

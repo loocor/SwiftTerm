@@ -45,7 +45,7 @@ class ParsingState {
     var collect: cstring
     var parameters: [Int32]
     var abort: Bool
-    
+
     init ()
     {
         position = 0
@@ -82,25 +82,25 @@ class TransitionTable {
     // data is packed like this:
     // currentState << 8 | characterCode  -->  action << 4 | nextState
     var table: [UInt8]
-    
+
     init (len: Int)
     {
         table = Array.init (repeating: 0, count: len)
     }
-    
+
     func add (code: UInt8, state: ParserState, action: ParserAction, next: ParserState)
     {
         let v = (UInt8 (action.rawValue) << 4) | next.rawValue
         table [(Int (state.rawValue) << 8) | Int(code)] = v
     }
-    
+
     func add (codes: [UInt8], state: ParserState, action: ParserAction, next: ParserState)
     {
         for c in codes {
             add (code: c, state: state, action: action, next: next)
         }
     }
-    
+
     subscript (idx: Int) -> UInt8 {
         get {
             return table [idx]
@@ -122,7 +122,7 @@ protocol  DcsHandler {
 /// to implement custom communication channels.
 ///
 public class EscapeSequenceParser {
-    
+
     static func r (low: UInt8, high: UInt8) -> [UInt8]
     {
         let c = high-low
@@ -132,7 +132,7 @@ public class EscapeSequenceParser {
         }
         return ret;
     }
-    
+
     static func rinclusive (low: ParserState, high: ParserState)-> [ParserState]
     {
         let c = high.rawValue-low.rawValue
@@ -142,26 +142,26 @@ public class EscapeSequenceParser {
         }
         return ret;
     }
-    
+
     static let NonAsciiPrintable : UInt8 = 0xa0
-    
+
     static func buildVt500TransitionTable () -> TransitionTable
     {
         let table = TransitionTable(len: 4095)
         let states = rinclusive(low: .ground, high: .dcsPassthrough)
-        
+
         // table with default transition
         for state in states {
             for code in 0...NonAsciiPrintable {
                 table.add(code: code, state: state, action: .error, next: .ground)
             }
         }
-        
+
         // printables
         let printables = r (low: 0x20, high: 0x7f)
         let executables = r (low: 0x00, high: 0x19) + r (low: 0x1c, high: 0x20)
         table.add (codes: printables, state: .ground, action: .print, next: .ground)
-        
+
         // global anywhere rules
         for state in states {
             table.add (codes: [0x18, 0x1a, 0x99, 0x9a], state: state, action: .execute, next: .ground)
@@ -210,7 +210,7 @@ public class EscapeSequenceParser {
         table.add (code: 0x3b, state: .csiParam, action: .param, next: .csiParam)
         table.add (codes: r (low: 0x40, high: 0x7f), state: .csiParam, action: .csiDispatch, next: .ground)
         table.add (codes: [0x3c, 0x3d, 0x3e, 0x3f], state: .csiParam, action: .ignore, next: .csiIgnore)
-        
+
         // csi for ":"
         table.add (code: 0x3a, state: .csiParam, action: .param, next: .csiParam)
         table.add (codes: r (low: 0x20, high: 0x40), state: .csiIgnore, action: .ignore, next: .csiIgnore)
@@ -265,33 +265,33 @@ public class EscapeSequenceParser {
         table.add (code: NonAsciiPrintable, state: .oscString, action: .oscPut, next: .oscString)
         return table
     }
-    
+
     // Array of parameters, and "collect" string
     typealias CsiHandler = ([Int],cstring) -> ()
     typealias CsiHandlerFallback = ([Int],cstring,UInt8) -> ()
-    
+
     /// Signature for an OSC handler, it will receive the byte array containing the data to this OSC sequence
     public typealias OscHandler = (ArraySlice<UInt8>) -> ()
-    
+
     /// If no OSC handler is found, this is the signature of a fallback method that will
     /// receive both the OSC code as the first parameter, along with a byte array containing
     /// the payload for the OSC message.
     public typealias OscHandlerFallback = (Int, ArraySlice<UInt8>) -> ()
-    
+
     typealias DscHandlerFallback = (UInt8, [Int]) -> ()
-    
+
     // Collect + flag
     typealias EscHandler = (cstring, UInt8) -> ()
     typealias EscHandlerFallback = (cstring, UInt8) -> ()
-    
+
     // Range of bytes to print out
     typealias PrintHandler = (ArraySlice<UInt8>) -> ()
-    
+
     typealias ExecuteHandler = () -> ()
-    
+
     // Handlers
     var csiHandlers: [UInt8:CsiHandler] = [:]
-    
+
     /// Maps an integer code to a handler that will be invoked when this value is
     /// found.   For example, to set a handler for the OSC 123, you would do:
     /// ```
@@ -304,13 +304,13 @@ public class EscapeSequenceParser {
     var executeHandlers: [UInt8:ExecuteHandler] = [:]
     var escHandlers: [cstring:EscHandler] = [:]
     var dcsHandlers: [cstring:DcsHandler] = [:]
-    
+
     var activeDcsHandler: DcsHandler? = nil
     var errorHandler: (ParsingState) -> ParsingState = { (state : ParsingState) -> ParsingState in return state; }
-    
+
     var initialState: ParserState = .ground
     var currentState: ParserState = .ground
-    
+
     // buffers over several calls
     var _osc: cstring
     var _pars: [Int]
@@ -318,9 +318,9 @@ public class EscapeSequenceParser {
     var _collect: cstring
     var printHandler: PrintHandler = { (slice : ArraySlice<UInt8>) -> () in }
     var printStateReset: () -> () = {  }
-    
+
     var table: TransitionTable
-    
+
     init ()
     {
         table = EscapeSequenceParser.buildVt500TransitionTable()
@@ -329,12 +329,12 @@ public class EscapeSequenceParser {
         _parsTxt = []
         _collect = []
         // "\"
-        setEscHandler("\\", { [unowned self] collect, flag in })
+        setEscHandler("\\", { collect, flag in })
     }
-    
+
     var escHandlerFallback: EscHandlerFallback = { (collect: cstring, flag: UInt8) in
     }
-    
+
     func setEscHandler (_ flag: String, _ callback: @escaping EscHandler)
     {
         escHandlers [Array (flag.utf8)] = callback
@@ -344,25 +344,25 @@ public class EscapeSequenceParser {
     {
         csiHandlers [flag.first!.asciiValue!] = callback
     }
-    
+
     func setDcsHandler (_ flag: String, _ callback: DcsHandler)
     {
         dcsHandlers [Array (flag.utf8)] = callback
     }
 
     var dscHandlerFallback: DscHandlerFallback = { code, pars in }
-    
+
     var executeHandlerFallback : ExecuteHandler = { () -> () in
     }
-    
+
     var csiHandlerFallback : CsiHandlerFallback = { (pars: [Int], collect: cstring, code: UInt8) -> () in
         print ("Cannot handle ESC-\(code)")
     }
-    
+
     var oscHandlerFallback: OscHandlerFallback = { code, data -> () in
-        
+
     }
-    
+
     func reset ()
     {
         currentState = initialState
@@ -387,7 +387,7 @@ public class EscapeSequenceParser {
             //print ("Got error while logging data dump to \(path)")
         }
     }
-    
+
     func parse (data: ArraySlice<UInt8>)
     {
         var code : UInt8 = 0
@@ -401,20 +401,20 @@ public class EscapeSequenceParser {
         var pars = self._pars
         var parsTxt = self._parsTxt
         var dcsHandler = activeDcsHandler
-        
+
         //dump (data)
-            
+
         // process input string
         var i = data.startIndex
         // let len = data.count
         let end = data.endIndex
         while i < end {
             code = data [i]
-            
+
             // 1f..80 are printable ascii characters
             // c2..f3 are valid utf8 beginning of sequence elements, and most importantly,
             // does not cover 0x90 which is the DCS initiator in 8 bit mode.
-            
+
             // The nice code is commented out, because this ends up consuming valid utf8 code when
             // we are in the middle of things (force a small reading buffer to see more easily)
             if currentState == .ground && code > 0x1f  { // }(code > 0x1f && code < 0x80 || (code > 0xc2 && code < 0xf3)) {
@@ -424,19 +424,19 @@ public class EscapeSequenceParser {
                 } while i < end && data [i] > 0x1f
                 continue;
             }
-            
+
             // shortcut for CSI params
             if currentState == .csiParam && (code > 0x2f && code < 0x39) {
                 let newV = pars [pars.count - 1] * 10 + Int(code) - 48
-                
-                // Prevent attempts at overflowing - crash 
+
+                // Prevent attempts at overflowing - crash
                 let willOverflow =  newV > ((Int.max/10)-10)
                 pars [pars.count - 1] = willOverflow ? 0 : newV
                 parsTxt.append(code)
                 i += 1
                 continue
             }
-            
+
             // Normal transition and action loop
             transition = table [(Int(currentState.rawValue) << 8) | Int (UInt8 ((code < 0xa0 ? code : EscapeSequenceParser.NonAsciiPrintable)))]
             let action = ParserAction (rawValue: transition >> 4)!
@@ -514,7 +514,7 @@ public class EscapeSequenceParser {
                     pars.append (0)
                 } else {
                     let newV = pars [pars.count - 1] * 10 + Int(code) - 48
-                    
+
                     // Prevent attempts at overflowing - crash
                     let willOverflow =  newV > ((Int.max/10)-10)
                     pars [pars.count - 1] = willOverflow ? 0 : newV
@@ -589,7 +589,7 @@ public class EscapeSequenceParser {
                     var oscCode : Int
                     var content : ArraySlice<UInt8>
                     let semiColonAscii = 59 // ';'
-                    
+
                     if let idx = osc.firstIndex (of: UInt8(semiColonAscii)){
                         oscCode = EscapeSequenceParser.parseInt (osc [0..<idx])
                         content = osc [(idx+1)...]
@@ -627,16 +627,16 @@ public class EscapeSequenceParser {
         _collect = collect
         _pars = pars
         _parsTxt = parsTxt
-        
+
         // save active dcs handler reference
         activeDcsHandler = dcsHandler
-        
+
         // save state
-        
+
         self.currentState = currentState
-        
+
     }
-    
+
     static func parseInt (_ str: ArraySlice<UInt8>) -> Int
     {
         var result = 0
@@ -644,7 +644,7 @@ public class EscapeSequenceParser {
             if x < 48 || x > 57 {
                 return result
             }
-            
+
             let newV = result * 10 + Int ((x - 48))
             let willOverflow =  newV > ((Int.max/10)-10)
             if willOverflow {
