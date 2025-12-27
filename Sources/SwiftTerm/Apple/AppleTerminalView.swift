@@ -1325,7 +1325,25 @@ extension TerminalView {
         let dirtyRowsSet = terminal.changedLines()
         dirtyRowsToDraw = dirtyRowsSet
 
+        let shouldForceFullRedraw: Bool = {
+            guard !dirtyRowsSet.isEmpty else { return false }
+            guard let minRow = dirtyRowsSet.min(), let maxRow = dirtyRowsSet.max() else { return false }
+            let span = maxRow - minRow + 1
+            let minSpan = max(terminal.rows / 2, 6)
+            let maxSparseCount = max(span / 4, 4)
+            return span >= minSpan && dirtyRowsSet.count <= maxSparseCount
+        }()
+
         terminal.clearUpdateRange ()
+        if shouldForceFullRedraw {
+            dirtyRowsToDraw = []
+            #if os(macOS)
+            setNeedsDisplay(bounds)
+            #else
+            setNeedsDisplay(frame)
+            #endif
+            return
+        }
                 
         #if os(macOS)
         let baseLine = frame.height
