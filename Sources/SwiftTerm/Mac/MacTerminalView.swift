@@ -375,7 +375,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         let style: NSScroller.Style = .legacy
         let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: style)
-        let scrollerFrame = NSRect(x: bounds.maxX - scrollerWidth, y: 0, width: scrollerWidth, height: bounds.height)
+        // Ensure height is always greater than width to maintain vertical orientation
+        // When bounds.height is zero or very small during init, use a minimum height
+        let scrollerHeight = max(bounds.height, scrollerWidth * 2)
+        let scrollerFrame = NSRect(x: bounds.maxX - scrollerWidth, y: 0, width: scrollerWidth, height: scrollerHeight)
         if scroller == nil {
             scroller = NSScroller(frame: scrollerFrame)
         } else {
@@ -383,6 +386,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         scroller.autoresizingMask = [.minXMargin, .height]
         scroller.scrollerStyle = style
+        scroller.wantsLayer = true // Ensure robust rendering on top of terminal content
         scroller.knobProportion = 0.1
         scroller.isEnabled = false
         if scroller.superview !== self { addSubview (scroller) }
@@ -399,7 +403,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         scroller.alphaValue = 1.0
         // Reapply a proper frame in case bounds changed before this call
         let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-        scroller.frame = NSRect(x: bounds.maxX - scrollerWidth, y: 0, width: scrollerWidth, height: bounds.height)
+        let scrollerHeight = max(bounds.height, scrollerWidth * 2)
+        scroller.frame = NSRect(x: bounds.maxX - scrollerWidth, y: 0, width: scrollerWidth, height: scrollerHeight)
         updateScroller()
     }
 
@@ -555,6 +560,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     public override func resizeSubviews(withOldSize oldSize: NSSize) {
         super.resizeSubviews(withOldSize: oldSize)
+        // Re-layout the scroller to match the new view bounds.
+        // Essential because autoresizingMask fails if started from zero frame.
+        setupScroller()
         updateScroller()
         selection.active = false
     }
